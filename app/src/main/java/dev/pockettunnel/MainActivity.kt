@@ -15,6 +15,8 @@ import android.view.View
 import android.widget.*
 import java.io.File
 import java.io.FileOutputStream
+import java.net.HttpURLConnection
+import java.net.URL
 import java.text.DateFormat
 import java.util.Date
 import java.util.Locale
@@ -378,8 +380,9 @@ class MainActivity : Activity() {
         text(body, "Project ZIP: ${tunnel.zipName.ifBlank { "not selected" }}", 12, ink, true, 0, 4)
         button("Prepare project ZIP", false) {
             if (tunnel.zipPath.isBlank()) { chooseZip(); return@button }
-            try { extractProject(File(tunnel.zipPath), store.projectDirOf(tunnel)); note("Project extracted into app storage.") } catch (e: Exception) { note(e.message ?: "Could not extract ZIP.") }
+            extractAndReport(tunnel)
         }
+        button("Test local server  ·  port ${tunnel.port}", false) { testLocalServer(tunnel) }
         button("Start backend  ·  port ${tunnel.port}", true) {
             val dir = store.projectDirOf(tunnel)
             val entryFile = File(dir, tunnel.entry).canonicalFile
@@ -424,12 +427,15 @@ class MainActivity : Activity() {
         gap(body, 6)
         if (isRunning) {
             button("Stop tunnel", true) { stopTunnel(tunnel); note("Stopping ${tunnel.name} on this phone.") }
+            button("Test local server  ·  port ${tunnel.port}", false) { testLocalServer(tunnel) }
+            button("View backend output", false) { showBackendLog(tunnel) }
             caption("Stop ends both the Node backend and the cloudflared connector for this tunnel.")
         } else {
             button("Extract project ZIP", false) {
                 if (tunnel.zipPath.isBlank() || !File(tunnel.zipPath).isFile) { note("The selected ZIP file is missing. Edit the tunnel and choose the ZIP again."); return@button }
-                try { extractProject(File(tunnel.zipPath), store.projectDirOf(tunnel)); note("Project extracted into app storage.") } catch (e: Exception) { note(e.message ?: "Could not extract ZIP.") }
+                extractAndReport(tunnel)
             }
+            button("Test local server  ·  port ${tunnel.port}", false) { testLocalServer(tunnel) }
             button("Start backend  ·  port ${tunnel.port}", true) {
                 val dir = store.projectDirOf(tunnel)
                 val entryFile = File(dir, tunnel.entry).canonicalFile
@@ -443,6 +449,8 @@ class MainActivity : Activity() {
                 startTunnelService(tunnel)
                 note("Starting the Cloudflare connector.")
             }
+            button("View backend output", false) { showBackendLog(tunnel) }
+            caption("If the public URL reports 502, run Test local server. A refused connection means the backend is not listening; a valid page means the port or hostname config is the problem.")
             caption("Keep the phone powered and online. Android battery controls may still stop services.")
         }
         button("Edit tunnel", false) { openWizard(tunnel) }
@@ -639,6 +647,57 @@ class MainActivity : Activity() {
             val failure = try { work(); null } catch (e: Throwable) { e }
             runOnUiThread { if (failure != null) note(failure.message ?: "Cloudflare request failed."); onDone(failure) }
         }.start()
+    }
+
+    private fun extractAndReport(tunnel: TunnelProfile) {
+        try {
+            val dir = store.projectDirOf(tunnel)
+            extractProject(File(tunnel.zipPath), dir)
+            val entryFile = File(dir, tunnel.entry)
+            if (entryFile.isFile) {
+                note("Project extracted into app storage.")
+                return
+            }
+            val matches = dir.walkTopDown().filter { it.isFile && !it.path.contains("/node_modules/") && it.name == tunnel.entry }.take(3).toList()
+            if (matches.size == 1) {
+                val relative = matches[0].toRelativeString(dir)
+                note("Extracted, but ${tunnel.entry} is at $relative — edit the Node entry file to this path.")
+            } else {
+                note("Project extracted, but ${tunnel.entry} was not found${if (matches.size > 1) " (it matches several files)" else ""}. Check the entry file name.")
+            }
+        } catch (e: Exception) {
+            note(e.message ?: "Could not extract ZIP.")
+        }
+    }
+
+    private fun testLocalServer(tunnel: TunnelProfile) {
+        note("Testing http://127.0.0.1:${tunnel.port} …")
+        Thread {
+            val message = try {
+                val connection = URL("http://127.0.0.1:${tunnel.port}/").openConnection() as HttpURLConnection
+                connection.connectTimeout = 5000
+                connection.readTimeout = 5000
+                connection.setRequestProperty("User-Agent", "PocketTunnel")
+                val code = connection.responseCode
+                val stream = if (code in 200..399) connection.inputStream else connection.errorStream
+                val body = stream?.bufferedReader()?.use { it.readText() }?.take(140)?.replace(Regex("\\s+"), " ") ?: ""
+                connection.disconnect()
+                "HTTP $code  ·  $body"
+            } catch (error: Throwable) {
+                "Nothing answered on port ${tunnel.port} (${error.message ?: "connection failed"}). Start the backend, or check its port."
+            }
+            runOnUiThread { note(message) }
+        }.start()
+    }
+
+    private fun showBackendLog(tunnel: TunnelProfile) {
+        val file = File(filesDir, "cloudflared/${tunnel.id.take(12)}.node.log")
+        val text = if (file.isFile) file.readText().takeLast(6000).ifBlank { "(log is empty)" } else "No backend output captured yet. Start the backend first."
+        val view = TextView(this).apply {
+            text = text; textSize = 11f; typeface = android.graphics.Typeface.MONOSPACE; setTextColor(ink); setPadding(dp(13), dp(13), dp(13), dp(13))
+        }
+        val scroll = ScrollView(this).apply { addView(view) }
+        AlertDialog.Builder(this).setTitle("Backend output · ${tunnel.name}").setView(scroll).setPositiveButton("Close", null).show()
     }
 
     private fun extractProject(zip: File, root: File) {

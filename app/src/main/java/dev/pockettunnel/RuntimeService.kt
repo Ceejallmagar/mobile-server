@@ -127,6 +127,9 @@ open class RuntimeService : Service() {
         backendRunning = true
         if (tunnelKey.isNotBlank()) RunState.mark(this, tunnelKey, tunnelName)
         refreshNotification()
+        try {
+            NodeEngine.redirectOutput(File(filesDir, "cloudflared/${tunnelKey.take(12)}.node.log").absolutePath)
+        } catch (error: Throwable) { Log.e(TAG, "Could not redirect backend output", error) }
         nodeThread = Thread {
             val code = try {
                 NodeEngine.startNode(arrayOf("node", entry), dir.absolutePath, port)
