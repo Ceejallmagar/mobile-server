@@ -229,6 +229,7 @@ open class RuntimeService : Service() {
         const val START_TUNNEL = "dev.pockettunnel.START_TUNNEL"
         const val STOP = "dev.pockettunnel.STOP"
         const val BROADCAST = "dev.pockettunnel.RUNTIME_STATE"
+        const val STATE = "runtime_state"
         const val STATE_RUNNING = "running"
         const val STATE_STOPPED = "stopped"
         const val PROJECT_DIR = "project_dir"
