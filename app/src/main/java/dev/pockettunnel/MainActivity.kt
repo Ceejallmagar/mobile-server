@@ -692,9 +692,9 @@ class MainActivity : Activity() {
 
     private fun showBackendLog(tunnel: TunnelProfile) {
         val file = File(filesDir, "cloudflared/${tunnel.id.take(12)}.node.log")
-        val text = if (file.isFile) file.readText().takeLast(6000).ifBlank { "(log is empty)" } else "No backend output captured yet. Start the backend first."
+        val logText = if (file.isFile) file.readText().takeLast(6000).ifBlank { "(log is empty)" } else "No backend output captured yet. Start the backend first."
         val view = TextView(this).apply {
-            text = text; textSize = 11f; typeface = android.graphics.Typeface.MONOSPACE; setTextColor(ink); setPadding(dp(13), dp(13), dp(13), dp(13))
+            setText(logText); textSize = 11f; typeface = android.graphics.Typeface.MONOSPACE; setTextColor(ink); setPadding(dp(13), dp(13), dp(13), dp(13))
         }
         val scroll = ScrollView(this).apply { addView(view) }
         AlertDialog.Builder(this).setTitle("Backend output · ${tunnel.name}").setView(scroll).setPositiveButton("Close", null).show()
