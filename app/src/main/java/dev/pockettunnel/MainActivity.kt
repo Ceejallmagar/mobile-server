@@ -57,6 +57,11 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (android.os.Build.VERSION.SDK_INT >= 26) {
+            getSystemService(android.app.NotificationManager::class.java).createNotificationChannel(
+                android.app.NotificationChannel("pocket_tunnel_runtime", "Backend and tunnel", android.app.NotificationManager.IMPORTANCE_LOW)
+            )
+        }
         store.migrateLegacy(prefs, secrets)
         RunStatus.seed(this)
         registerReceiver(receiver, IntentFilter(RuntimeService.BROADCAST))
@@ -601,6 +606,9 @@ class MainActivity : Activity() {
     }
 
     private fun startForegroundServiceCompat(intent: Intent) {
+        if (android.os.Build.VERSION.SDK_INT >= 33 && !getSystemService(android.app.NotificationManager::class.java).areNotificationsEnabled()) {
+            note("Android has notifications disabled for Pocket Tunnel. Enable app notifications in Android Settings to see the runtime notification.")
+        }
         if (android.os.Build.VERSION.SDK_INT >= 26) startForegroundService(intent) else startService(intent)
     }
 
@@ -691,8 +699,11 @@ class MainActivity : Activity() {
     }
 
     private fun showBackendLog(tunnel: TunnelProfile) {
-        val file = File(filesDir, "cloudflared/${tunnel.id.take(12)}.node.log")
-        val logText = if (file.isFile) file.readText().takeLast(6000).ifBlank { "(log is empty)" } else "No backend output captured yet. Start the backend first."
+        val backendFile = File(filesDir, "cloudflared/${tunnel.id.take(12)}.node.log")
+        val tunnelFile = File(filesDir, "cloudflared/${tunnel.id.take(12)}.log")
+        val backendLog = if (backendFile.isFile) backendFile.readText().takeLast(6000) else "No backend output captured yet."
+        val tunnelLog = if (tunnelFile.isFile) tunnelFile.readText().takeLast(6000) else "No Cloudflare connector output captured yet."
+        val logText = "BACKEND OUTPUT\n$backendLog\n\nCLOUDFLARE TUNNEL OUTPUT\n$tunnelLog".takeLast(12000)
         val view = TextView(this).apply {
             setText(logText); textSize = 11f; typeface = android.graphics.Typeface.MONOSPACE; setTextColor(ink); setPadding(dp(13), dp(13), dp(13), dp(13))
         }

@@ -97,6 +97,8 @@ open class RuntimeService : Service() {
     private var tunnelKey = ""
     private var tunnelName = ""
     private var backendRunning = false
+    private var backendStatus = "stopped"
+    private var tunnelStatus = "stopped"
     private var wakeLock: PowerManager.WakeLock? = null
     private val channelId = "pocket_tunnel_runtime"
     private val notificationId = 27
@@ -122,8 +124,15 @@ open class RuntimeService : Service() {
         val dir = File(intent.getStringExtra(PROJECT_DIR) ?: return)
         val entry = intent.getStringExtra(ENTRY) ?: return
         val port = intent.getStringExtra(PORT) ?: "3000"
-        if (!File(dir, entry).isFile) { Log.e(TAG, "Backend entry file was not found: ${File(dir, entry)}"); return }
+        if (!File(dir, entry).isFile) {
+            backendStatus = "failed (entry file missing)"
+            Log.e(TAG, "Backend entry file was not found: ${File(dir, entry)}")
+            refreshNotification()
+            return
+        }
         if (nodeThread?.isAlive == true) { Log.i(TAG, "Backend already running in this runtime slot."); return }
+        backendStatus = "starting"
+        refreshNotification()
         val logFile = File(filesDir, "cloudflared/${tunnelKey.take(12)}.node.log")
         try {
             logFile.parentFile?.mkdirs()
@@ -137,12 +146,14 @@ open class RuntimeService : Service() {
             Log.e(TAG, "Could not prepare backend output log", error)
         }
         backendRunning = true
+        backendStatus = "running"
         if (tunnelKey.isNotBlank()) RunState.mark(this, tunnelKey, tunnelName)
         refreshNotification()
         nodeThread = Thread {
             val startedAt = System.currentTimeMillis()
             val code = try {
-                NodeEngine.startNode(arrayOf("node", entry), dir.absolutePath, port)
+                val tempDir = File(cacheDir, "node-tmp").apply { mkdirs() }
+                NodeEngine.startNode(arrayOf("node", entry), dir.absolutePath, port, filesDir.absolutePath, tempDir.absolutePath)
             } catch (error: Throwable) {
                 Log.e(TAG, "Node runtime could not start", error)
                 appendBackendLog(logFile, "Node runtime could not start: ${Log.getStackTraceString(error)}")
@@ -151,8 +162,9 @@ open class RuntimeService : Service() {
             Log.i(TAG, "Node exited with $code")
             appendBackendLog(logFile, "Node process exited with code $code after ${(System.currentTimeMillis() - startedAt) / 1000.0}s.")
             backendRunning = false
+            backendStatus = "stopped (exit code $code)"
             refreshNotification()
-            if (tunnelProcess == null) stopAll()
+            releaseWakeLockIfIdle()
         }.also { it.start() }
     }
 
@@ -168,8 +180,10 @@ open class RuntimeService : Service() {
         val token = intent.getStringExtra(TUNNEL_TOKEN) ?: return
         tunnelProcess?.destroy()
         tunnelProcess = null
+        tunnelStatus = "starting"
         refreshNotification()
         Thread {
+            val logFile = File(filesDir, "cloudflared/${tunnelKey.take(12)}.log").apply { parentFile?.mkdirs() }
             try {
                 val binary = File(filesDir, "runtime/cloudflared")
                 if (!binary.isFile) {
@@ -179,18 +193,25 @@ open class RuntimeService : Service() {
                 binary.setExecutable(true, true)
                 val process = ProcessBuilder(binary.absolutePath, "tunnel", "--no-autoupdate", "run", "--token", token)
                     .redirectErrorStream(true)
-                    .redirectOutput(File(filesDir, "cloudflared/${tunnelKey.take(12)}.log").apply { parentFile?.mkdirs() })
+                    .redirectOutput(logFile)
                     .start()
                 tunnelProcess = process
+                tunnelStatus = "running"
                 refreshNotification()
-                process.waitFor()
+                val code = process.waitFor()
                 if (tunnelProcess === process) {
                     tunnelProcess = null
+                    tunnelStatus = "stopped (exit code $code)"
+                    logFile.appendText("\ncloudflared exited with code $code\n")
                     refreshNotification()
-                    if (!backendRunning) stopAll()
+                    releaseWakeLockIfIdle()
                 }
             } catch (error: Throwable) {
                 Log.e(TAG, "Cloudflare tunnel could not start", error)
+                tunnelStatus = "failed to start"
+                runCatching { logFile.appendText("\nCould not start cloudflared: ${Log.getStackTraceString(error)}\n") }
+                refreshNotification()
+                releaseWakeLockIfIdle()
             }
         }.start()
     }
@@ -215,6 +236,13 @@ open class RuntimeService : Service() {
         }
     }
 
+    private fun releaseWakeLockIfIdle() {
+        if (!backendRunning && tunnelProcess == null) {
+            wakeLock?.let { if (it.isHeld) it.release() }
+            wakeLock = null
+        }
+    }
+
     private fun refreshNotification() {
         getSystemService(NotificationManager::class.java).notify(notificationId, buildNotification())
     }
@@ -230,10 +258,13 @@ open class RuntimeService : Service() {
         val stop = Intent(this, javaClass).setAction(STOP)
         val pending = PendingIntent.getService(this, 28, stop, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         val text = when {
-            backendRunning && tunnelProcess != null -> "$tunnelName is running"
-            backendRunning -> "$tunnelName backend is running"
-            tunnelProcess != null -> "$tunnelName tunnel is running"
-            else -> "Nothing is running"
+            backendRunning && tunnelProcess != null -> "$tunnelName · backend and tunnel running"
+            backendRunning -> "$tunnelName · backend running; tunnel $tunnelStatus"
+            tunnelProcess != null -> "$tunnelName · tunnel running; backend $backendStatus"
+            backendStatus.contains("exit code") || tunnelStatus.contains("exit code") || tunnelStatus == "failed to start" ->
+                "$tunnelName · backend $backendStatus; tunnel $tunnelStatus"
+            backendStatus == "starting" || tunnelStatus == "starting" -> "$tunnelName · backend $backendStatus; tunnel $tunnelStatus"
+            else -> "$tunnelName · backend $backendStatus; tunnel $tunnelStatus"
         }
         return Notification.Builder(this, channelId).setSmallIcon(android.R.drawable.stat_sys_upload)
             .setContentTitle("Pocket Tunnel").setContentText(text)
