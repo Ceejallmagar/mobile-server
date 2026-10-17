@@ -140,17 +140,28 @@ open class RuntimeService : Service() {
         if (tunnelKey.isNotBlank()) RunState.mark(this, tunnelKey, tunnelName)
         refreshNotification()
         nodeThread = Thread {
+            val startedAt = System.currentTimeMillis()
             val code = try {
                 NodeEngine.startNode(arrayOf("node", entry), dir.absolutePath, port)
             } catch (error: Throwable) {
                 Log.e(TAG, "Node runtime could not start", error)
+                appendBackendLog(logFile, "Node runtime could not start: ${Log.getStackTraceString(error)}")
                 -1
             }
             Log.i(TAG, "Node exited with $code")
+            appendBackendLog(logFile, "Node process exited with code $code after ${(System.currentTimeMillis() - startedAt) / 1000.0}s.")
             backendRunning = false
             refreshNotification()
             if (tunnelProcess == null) stopAll()
         }.also { it.start() }
+    }
+
+    private fun appendBackendLog(file: File, message: String) {
+        try {
+            file.appendText("\n$message\n")
+        } catch (error: Throwable) {
+            Log.e(TAG, "Could not append backend diagnostic to ${file.absolutePath}", error)
+        }
     }
 
     private fun startTunnel(intent: Intent) {
