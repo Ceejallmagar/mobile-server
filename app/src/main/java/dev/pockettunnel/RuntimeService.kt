@@ -124,12 +124,21 @@ open class RuntimeService : Service() {
         val port = intent.getStringExtra(PORT) ?: "3000"
         if (!File(dir, entry).isFile) { Log.e(TAG, "Backend entry file was not found: ${File(dir, entry)}"); return }
         if (nodeThread?.isAlive == true) { Log.i(TAG, "Backend already running in this runtime slot."); return }
+        val logFile = File(filesDir, "cloudflared/${tunnelKey.take(12)}.node.log")
+        try {
+            logFile.parentFile?.mkdirs()
+            if (!logFile.exists()) logFile.createNewFile()
+            logFile.appendText("\n--- Starting Node: ${entry} on port ${port} ---\n")
+            val errorCode = NodeEngine.redirectOutput(logFile.absolutePath)
+            if (errorCode != 0) {
+                Log.e(TAG, "Could not open backend output log (errno=$errorCode): ${logFile.absolutePath}")
+            }
+        } catch (error: Throwable) {
+            Log.e(TAG, "Could not prepare backend output log", error)
+        }
         backendRunning = true
         if (tunnelKey.isNotBlank()) RunState.mark(this, tunnelKey, tunnelName)
         refreshNotification()
-        try {
-            NodeEngine.redirectOutput(File(filesDir, "cloudflared/${tunnelKey.take(12)}.node.log").absolutePath)
-        } catch (error: Throwable) { Log.e(TAG, "Could not redirect backend output", error) }
         nodeThread = Thread {
             val code = try {
                 NodeEngine.startNode(arrayOf("node", entry), dir.absolutePath, port)

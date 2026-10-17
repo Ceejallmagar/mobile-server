@@ -5,17 +5,23 @@
 #include <vector>
 #include <unistd.h>
 #include <fcntl.h>
+#include <cerrno>
+#include <android/log.h>
 
-extern "C" JNIEXPORT void JNICALL
+extern "C" JNIEXPORT jint JNICALL
 Java_dev_pockettunnel_NodeEngine_redirectOutput(JNIEnv *env, jobject, jstring path) {
     const char *target = env->GetStringUTFChars(path, nullptr);
     int fd = open(target, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    const int error = fd < 0 ? errno : 0;
     if (fd >= 0) {
         dup2(fd, STDOUT_FILENO);
         dup2(fd, STDERR_FILENO);
         if (fd > STDERR_FILENO) close(fd);
+    } else {
+        __android_log_print(ANDROID_LOG_ERROR, "PocketTunnelRuntime", "Could not open Node output log %s: %d", target, error);
     }
     env->ReleaseStringUTFChars(path, target);
+    return error;
 }
 
 extern "C" JNIEXPORT jint JNICALL
