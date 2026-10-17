@@ -11,6 +11,18 @@ Pocket Tunnel is a native Android app that is designed to run a Node.js backend 
 5. Apply the hostname and local port to the tunnel's Cloudflare configuration. The app also writes a `config.yml` snapshot in its private storage.
 6. Extract the ZIP and start the Node process and `cloudflared` from the app. An Android foreground service keeps them running and provides a Stop action in its notification.
 
+## Managing multiple tunnels
+
+Tunnels are managed from the home list, so creating a second tunnel never resets the first one.
+
+- Every tunnel profile (name, project, ZIP, port, entry file, hostname, tunnel ID, zone, flags) is stored as JSON in `tunnels` shared preferences and survives app restarts.
+- Each tunnel gets its own encrypted connector token (`tunnel-token:<id>` in the Keystore-backed SecretStore).
+- From the list, tapping a finished tunnel opens its detail page with all saved info, Start/Stop actions, Edit, and Delete. Delete works locally, or locally plus remotely through `DELETE /accounts/<id>/cfd_tunnel`.
+- Setup can be paused at any step; the draft persists and shows as "Setup incomplete" in the list.
+- The **Profile** page shows the saved Cloudflare account ID (copy on tap), the API token (hidden, tap to reveal), token verification, counts, and a delete-all-data action.
+- Up to four tunnels can run at the same time: each one holds a runtime slot that starts a dedicated foreground service in its own Android process (`:runtime0` … `:runtime3`), containing its Node backend and `cloudflared` connector. The list shows a live Running/Stopped badge via runtime status broadcasts.
+- Existing single-tunnel installs migrate automatically: the old setup preferences are converted into the first tunnel profile and the old encrypted token is remapped, so nothing needs to be set up again after updating.
+
 The laptop's `cloudflared tunnel login` state is not needed or copied. Cloudflare still requires explicit authorization: create a narrowly scoped API token in your account with Cloudflare Tunnel Write, Zone Read, and DNS Write, then paste it into the app. The account and token are not sent to any service other than Cloudflare. Cloudflare's API creates the tunnel and token, manages its ingress configuration, and creates the DNS route.
 
 ## Runtime and project constraints
@@ -18,6 +30,7 @@ The laptop's `cloudflared tunnel login` state is not needed or copied. Cloudflar
 - The app embeds Node.js for Android and an Android `cloudflared` connector in its APK. It does not ask the phone owner to install Termux, Node, or cloudflared separately.
 - The current embedded Node runtime is Node 18.20.4, arm64 only. The uploaded ZIP must contain the selected entry file and its dependencies under `node_modules`; this starter does not run `npm install` or compile native npm modules.
 - The phone must stay powered, online, and allowed to run the foreground service. Android battery controls may still stop services.
+- Concurrent runtimes share one embedded Node process per runtime slot; four simultaneous tunnels are supported. Starting more than four shows a UI hint to stop a tunnel first.
 - The APK currently targets Android API 28 to permit launching its build bundled connector binary. This is a sideload/development build configuration and is not ready for Google Play distribution.
 
 ## Build an APK

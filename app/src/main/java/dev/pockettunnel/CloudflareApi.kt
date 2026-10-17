@@ -71,6 +71,10 @@ class CloudflareApi(private val token: String) {
         request("PUT", "/accounts/$accountId/cfd_tunnel/$tunnelId/configurations", JSONObject().put("config", JSONObject().put("ingress", ingress)))
     }
 
+    fun deleteTunnel(accountId: String, tunnelId: String) {
+        request("DELETE", "/accounts/$accountId/cfd_tunnel/$tunnelId")
+    }
+
     private fun findZone(accountId: String, hostname: String): JSONObject {
         val labels = hostname.split('.')
         for (start in 0 until labels.lastIndex) {

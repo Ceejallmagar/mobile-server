@@ -38,4 +38,11 @@ class SecretStore(context: Context) {
         } catch (_: Exception) { null }
     }
     fun clear(name: String) { prefs.edit().remove(name).apply() }
+    fun rename(oldName: String, newName: String) {
+        val value = get(oldName) ?: return
+        put(newName, value)
+        clear(oldName)
+    }
+    fun clearAll() { prefs.edit().clear().apply() }
+    fun keys(): Set<String> = prefs.all.keys.toSet()
 }

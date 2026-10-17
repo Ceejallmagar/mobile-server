@@ -6,6 +6,9 @@
         <activity android:name=".MainActivity" android:exported="true">
             <intent-filter><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent-filter>
         </activity>
-        <service android:name=".RuntimeService" android:exported="false" android:process=":runtime" />
+        <service android:name=".RuntimeService" android:exported="false" android:process=":runtime0" />
+        <service android:name=".RuntimeSlot1" android:exported="false" android:process=":runtime1" />
+        <service android:name=".RuntimeSlot2" android:exported="false" android:process=":runtime2" />
+        <service android:name=".RuntimeSlot3" android:exported="false" android:process=":runtime3" />
     </application>
 </manifest>
