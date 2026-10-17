@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <cerrno>
+#include <cstring>
 #include <android/log.h>
 
 extern "C" JNIEXPORT jint JNICALL
@@ -52,16 +53,27 @@ Java_dev_pockettunnel_NodeEngine_startNode(JNIEnv *env, jobject, jobjectArray ja
 
     const jsize count = env->GetArrayLength(java_args);
     std::vector<std::string> arguments;
-    std::vector<char *> argv;
     arguments.reserve(count);
-    argv.reserve(count);
+    size_t buffer_size = 0;
     for (jsize i = 0; i < count; ++i) {
         auto item = static_cast<jstring>(env->GetObjectArrayElement(java_args, i));
         const char *value = env->GetStringUTFChars(item, nullptr);
         arguments.emplace_back(value);
+        buffer_size += arguments.back().size() + 1;
         env->ReleaseStringUTFChars(item, value);
         env->DeleteLocalRef(item);
     }
-    for (auto &arg : arguments) argv.push_back(arg.data());
+    // nodejs-mobile's Android/libuv entry point expects all argv strings in one
+    // contiguous allocation. Separate std::string buffers can make Node parse
+    // the entry-point arguments incorrectly and return without opening a port.
+    std::vector<char> argv_buffer(buffer_size);
+    std::vector<char *> argv;
+    argv.reserve(count);
+    char *cursor = argv_buffer.data();
+    for (const auto &arg : arguments) {
+        argv.push_back(cursor);
+        std::memcpy(cursor, arg.c_str(), arg.size() + 1);
+        cursor += arg.size() + 1;
+    }
     return node::Start(static_cast<int>(argv.size()), argv.data());
 }
