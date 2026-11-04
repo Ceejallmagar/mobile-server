@@ -97,6 +97,7 @@ open class RuntimeService : Service() {
     private var tunnelKey = ""
     private var tunnelName = ""
     private var backendRunning = false
+    private var tunnelStarting = false
     private var backendStatus = "stopped"
     private var tunnelStatus = "stopped"
     private var wakeLock: PowerManager.WakeLock? = null
@@ -121,15 +122,24 @@ open class RuntimeService : Service() {
     }
 
     private fun startBackend(intent: Intent) {
-        val dir = File(intent.getStringExtra(PROJECT_DIR) ?: return)
+        val dir = File(intent.getStringExtra(PROJECT_DIR) ?: return).canonicalFile
         val entry = intent.getStringExtra(ENTRY) ?: return
         val port = intent.getStringExtra(PORT) ?: "3000"
-        if (!File(dir, entry).isFile) {
+        val entryFile = File(dir, entry).canonicalFile
+        if (!entryFile.path.startsWith(dir.path + File.separator) || !entryFile.isFile) {
             backendStatus = "failed (entry file missing)"
-            Log.e(TAG, "Backend entry file was not found: ${File(dir, entry)}")
+            Log.e(TAG, "Backend entry file was not found inside $dir: $entry")
             refreshNotification()
             return
         }
+        // Projects are often zipped with a wrapper folder (for example server/).
+        // Run from the closest package root so dotenv.config(), package.json and
+        // relative config paths resolve the same way they do from that project.
+        val workingDir = generateSequence(entryFile.parentFile) { it.parentFile }
+            .takeWhile { it.path == dir.path || it.path.startsWith(dir.path + File.separator) }
+            .firstOrNull { File(it, "package.json").isFile }
+            ?: dir
+        val script = entryFile.relativeTo(workingDir).path
         if (nodeThread?.isAlive == true) { Log.i(TAG, "Backend already running in this runtime slot."); return }
         backendStatus = "starting"
         refreshNotification()
@@ -137,7 +147,15 @@ open class RuntimeService : Service() {
         try {
             logFile.parentFile?.mkdirs()
             if (!logFile.exists()) logFile.createNewFile()
-            logFile.appendText("\n--- Starting Node: ${entry} on port ${port} ---\n")
+            logFile.appendText("\n--- Starting Node: $script (entry: $entry), cwd: $workingDir, port: $port ---\n")
+            val configuredDbHost = File(workingDir, ".env").takeIf { it.isFile }
+                ?.useLines { lines -> lines.firstNotNullOfOrNull { line ->
+                    val trimmed = line.trim()
+                    if (!trimmed.startsWith("DB_HOST=")) null else trimmed.substringAfter('=').trim().trim('"', '\'')
+                } }
+            if (configuredDbHost.equals("localhost", ignoreCase = true) || configuredDbHost == "127.0.0.1" || configuredDbHost == "::1") {
+                logFile.appendText("NOTICE: .env DB_HOST points to this Android phone. MySQL must be running on the phone, or change DB_HOST to a database host reachable from the phone.\n")
+            }
             val errorCode = NodeEngine.redirectOutput(logFile.absolutePath)
             if (errorCode != 0) {
                 Log.e(TAG, "Could not open backend output log (errno=$errorCode): ${logFile.absolutePath}")
@@ -153,7 +171,7 @@ open class RuntimeService : Service() {
             val startedAt = System.currentTimeMillis()
             val code = try {
                 val tempDir = File(cacheDir, "node-tmp").apply { mkdirs() }
-                NodeEngine.startNode(arrayOf("node", entry), dir.absolutePath, port, filesDir.absolutePath, tempDir.absolutePath)
+                NodeEngine.startNode(arrayOf("node", script), workingDir.absolutePath, port, filesDir.absolutePath, tempDir.absolutePath)
             } catch (error: Throwable) {
                 Log.e(TAG, "Node runtime could not start", error)
                 appendBackendLog(logFile, "Node runtime could not start: ${Log.getStackTraceString(error)}")
@@ -164,7 +182,7 @@ open class RuntimeService : Service() {
             backendRunning = false
             backendStatus = "stopped (exit code $code)"
             refreshNotification()
-            releaseWakeLockIfIdle()
+            finishRuntimeIfIdle()
         }.also { it.start() }
     }
 
@@ -180,6 +198,7 @@ open class RuntimeService : Service() {
         val token = intent.getStringExtra(TUNNEL_TOKEN) ?: return
         tunnelProcess?.destroy()
         tunnelProcess = null
+        tunnelStarting = true
         tunnelStatus = "starting"
         refreshNotification()
         Thread {
@@ -196,6 +215,7 @@ open class RuntimeService : Service() {
                     .redirectOutput(logFile)
                     .start()
                 tunnelProcess = process
+                tunnelStarting = false
                 tunnelStatus = "running"
                 refreshNotification()
                 val code = process.waitFor()
@@ -204,14 +224,15 @@ open class RuntimeService : Service() {
                     tunnelStatus = "stopped (exit code $code)"
                     logFile.appendText("\ncloudflared exited with code $code\n")
                     refreshNotification()
-                    releaseWakeLockIfIdle()
+                    finishRuntimeIfIdle()
                 }
             } catch (error: Throwable) {
                 Log.e(TAG, "Cloudflare tunnel could not start", error)
+                tunnelStarting = false
                 tunnelStatus = "failed to start"
                 runCatching { logFile.appendText("\nCould not start cloudflared: ${Log.getStackTraceString(error)}\n") }
                 refreshNotification()
-                releaseWakeLockIfIdle()
+                finishRuntimeIfIdle()
             }
         }.start()
     }
@@ -236,10 +257,16 @@ open class RuntimeService : Service() {
         }
     }
 
-    private fun releaseWakeLockIfIdle() {
-        if (!backendRunning && tunnelProcess == null) {
+    private fun finishRuntimeIfIdle() {
+        if (!backendRunning && tunnelProcess == null && !tunnelStarting) {
+            if (tunnelKey.isNotBlank()) {
+                RunState.clear(this, tunnelKey)
+                broadcast(stop = true)
+            }
             wakeLock?.let { if (it.isHeld) it.release() }
             wakeLock = null
+            stopForeground(true)
+            stopSelf()
         }
     }
 

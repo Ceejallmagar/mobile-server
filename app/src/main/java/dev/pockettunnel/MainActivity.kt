@@ -401,6 +401,7 @@ class MainActivity : Activity() {
             startTunnelService(tunnel)
             note("Starting the Cloudflare connector.")
         }
+        button("View backend and tunnel output", false) { showBackendLog(tunnel) }
         text(body, if (tunnel.hostname.isBlank()) "Your public address will appear here after you finish the hostname step." else "Public address: https://${tunnel.hostname}", 14, green, true, 0, 14)
         if (!tunnel.complete) {
             button("Save tunnel", true) { tunnel.complete = true; store.save(tunnel); openDetail(tunnel.id); note("Tunnel saved. You can start it any time from the tunnel list.") }
@@ -681,7 +682,7 @@ class MainActivity : Activity() {
     private fun testLocalServer(tunnel: TunnelProfile) {
         note("Testing http://127.0.0.1:${tunnel.port} …")
         Thread {
-            val message = try {
+            val result = try {
                 val connection = URL("http://127.0.0.1:${tunnel.port}/").openConnection() as HttpURLConnection
                 connection.connectTimeout = 5000
                 connection.readTimeout = 5000
@@ -690,12 +691,44 @@ class MainActivity : Activity() {
                 val stream = if (code in 200..399) connection.inputStream else connection.errorStream
                 val body = stream?.bufferedReader()?.use { it.readText() }?.take(140)?.replace(Regex("\\s+"), " ") ?: ""
                 connection.disconnect()
-                "HTTP $code  ·  $body"
+                "HTTP $code  ·  $body" to null
             } catch (error: Throwable) {
-                "Nothing answered on port ${tunnel.port} (${error.message ?: "connection failed"}). Start the backend, or check its port."
+                val logFile = File(filesDir, "cloudflared/${tunnel.id.take(12)}.node.log")
+                val log = if (logFile.isFile) runCatching { logFile.readText().takeLast(5000) }.getOrDefault("") else ""
+                val tunnelLogFile = File(filesDir, "cloudflared/${tunnel.id.take(12)}.log")
+                val tunnelLog = if (tunnelLogFile.isFile) runCatching { tunnelLogFile.readText().takeLast(3000) }.getOrDefault("") else ""
+                val message = buildString {
+                    append("Nothing answered on port ${tunnel.port}.\n\n")
+                    append("Connection error: ${error.message ?: "connection failed"}\n\n")
+                    append("Start the backend and make sure it listens on port ${tunnel.port}.")
+                    if (log.isNotBlank()) append("\n\nRecent backend output:\n$log")
+                    else append("\n\nNo backend output log exists yet. Start backend once, then check View backend output.")
+                    if (tunnelLog.isNotBlank()) append("\n\nRecent Cloudflare output:\n$tunnelLog")
+                }
+                null to message
             }
-            runOnUiThread { note(message) }
+            runOnUiThread {
+                val failure = result.second
+                if (failure == null) note(result.first ?: "Local server responded.") else showRuntimeFailure(tunnel, failure)
+            }
         }.start()
+    }
+
+    private fun showRuntimeFailure(tunnel: TunnelProfile, message: String) {
+        val view = TextView(this).apply {
+            text = message
+            textSize = 12f
+            typeface = android.graphics.Typeface.MONOSPACE
+            setTextColor(ink)
+            setPadding(dp(14), dp(14), dp(14), dp(14))
+        }
+        val scroll = ScrollView(this).apply { addView(view) }
+        AlertDialog.Builder(this)
+            .setTitle("Local server is not responding")
+            .setView(scroll)
+            .setPositiveButton("View all output") { _, _ -> showBackendLog(tunnel) }
+            .setNegativeButton("Close", null)
+            .show()
     }
 
     private fun showBackendLog(tunnel: TunnelProfile) {
