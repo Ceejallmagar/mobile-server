@@ -652,6 +652,22 @@ class MainActivity : Activity() {
         }
         body.addView(preview, match(8))
         if (file.length() > count) caption("Preview is limited to the first 128 KB.")
+        if (extension in textExtensions) button("Edit this file", true) {
+            val editor = EditText(this).apply {
+                setText(file.readText(Charsets.UTF_8))
+                typeface = android.graphics.Typeface.MONOSPACE
+                gravity = Gravity.TOP or Gravity.START
+                minLines = 12
+                setPadding(dp(12), dp(10), dp(12), dp(10))
+            }
+            AlertDialog.Builder(this).setTitle("Edit ${file.name}").setView(ScrollView(this).apply { addView(editor) })
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Save") { _, _ ->
+                    runCatching { file.writeText(editor.text.toString(), Charsets.UTF_8) }
+                        .onSuccess { note("Saved ${file.name}."); render() }
+                        .onFailure { note("Could not save file: ${it.message}") }
+                }.show()
+        }
     }
 
     private fun formatFileSize(bytes: Long): String = when {
@@ -685,7 +701,7 @@ class MainActivity : Activity() {
             return
         }
         if (!File(projectRoot, ".env").isFile) {
-            databaseError = "No project .env file was found. Add DATABASE_URL or DB_HOST/DB_USER/DB_PASSWORD settings, then extract the ZIP again."
+            databaseError = "Set up a database connection first."
             databaseLoading = false
             render()
             return
@@ -721,6 +737,8 @@ class MainActivity : Activity() {
         text(body, "DATABASE MANAGER", 11, green, true, 0, 8)
         text(body, "${tunnel.projectName} database", 26, ink, true, 0, 6)
         text(body, "Read-only access to the database configured for this extracted backend. Password values stay hidden and are read from its .env file.", 13, muted, false, 0, 12)
+        button("Configure database connection", true) { showDatabaseConfig(tunnel) }
+        caption("SQLite is stored on this phone. MySQL, PostgreSQL and MongoDB settings connect to a server you already run; this app does not yet install those server engines on Android.")
         card("Connection")
         if (databaseProvider.isNotBlank()) row("Database type", databaseProvider)
         if (databaseName.isNotBlank()) row("Database", databaseName)
@@ -764,6 +782,53 @@ class MainActivity : Activity() {
             }
         }
         caption("MySQL/MariaDB, PostgreSQL and MongoDB use the matching driver in the ZIP's node_modules. SQLite files are opened directly by Android. Queries are read-only and limited to 100 rows per table.")
+    }
+
+    private fun showDatabaseConfig(tunnel: TunnelProfile) {
+        val root = databaseWorkingDirectory(tunnel)
+        if (!root.isDirectory) { note("Extract the project ZIP first."); return }
+        val envFile = File(root, ".env")
+        val env = envFile.takeIf { it.isFile }?.readLines().orEmpty()
+        fun current(key: String, fallback: String = ""): String = env.firstOrNull { it.trim().startsWith("$key=") }?.substringAfter('=')?.trim()?.trim('"', '\'') ?: fallback
+        val panel = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(8), dp(4), dp(8), dp(4)) }
+        val provider = Spinner(this)
+        provider.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, listOf("SQLite (on this phone)", "MySQL / MariaDB", "PostgreSQL", "MongoDB"))
+        val type = current("DB_TYPE").lowercase()
+        provider.setSelection(when { type.contains("mysql") || type.contains("maria") -> 1; type.contains("postgres") || type == "pg" -> 2; type.contains("mongo") -> 3; else -> 0 })
+        panel.addView(provider, match(4))
+        val name = EditText(this).apply { hint = "Database name (or SQLite path)"; setText(current("DB_NAME", if (provider.selectedItemPosition == 0) "pocket.db" else "appdb")); setSingleLine(true) }
+        val host = EditText(this).apply { hint = "Host (remote DB only)"; setText(current("DB_HOST", "127.0.0.1")); setSingleLine(true) }
+        val port = EditText(this).apply { hint = "Port"; setText(current("DB_PORT", "3306")); setSingleLine(true); inputType = 2 }
+        val user = EditText(this).apply { hint = "Username"; setText(current("DB_USER")); setSingleLine(true) }
+        val password = EditText(this).apply { hint = "Password"; setText(current("DB_PASSWORD")); setSingleLine(true); inputType = 129 }
+        listOf(name, host, port, user, password).forEach { panel.addView(it, match(3)) }
+        provider.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+            override fun onNothingSelected(parent: android.widget.AdapterView<*>?) = Unit
+            override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: View?, position: Int, id: Long) {
+                port.setText(when (position) { 1 -> "3306"; 2 -> "5432"; 3 -> "27017"; else -> "" })
+                host.isEnabled = position != 0; port.isEnabled = position != 0; user.isEnabled = position != 0; password.isEnabled = position != 0
+                name.hint = if (position == 0) "SQLite file path (e.g. pocket.db)" else "Database name"
+            }
+        }
+        AlertDialog.Builder(this).setTitle("Database connection")
+            .setMessage("This writes database connection settings to the project .env. Use SQLite for a database file on this phone, or enter a reachable server for MySQL, PostgreSQL or MongoDB.")
+            .setView(ScrollView(this).apply { addView(panel) }).setNegativeButton("Cancel", null)
+            .setPositiveButton("Save settings") { _, _ ->
+                val kind = when (provider.selectedItemPosition) { 1 -> "mysql"; 2 -> "postgres"; 3 -> "mongodb"; else -> "sqlite" }
+                val dbName = name.text.toString().trim()
+                val values = linkedMapOf("DB_TYPE" to kind, "DB_NAME" to dbName, "DB_HOST" to host.text.toString().trim(), "DB_PORT" to port.text.toString().trim(), "DB_USER" to user.text.toString().trim(), "DB_PASSWORD" to password.text.toString())
+                if (kind == "sqlite") values["DB_PATH"] = dbName
+                if (kind == "mongodb") {
+                    val credentials = if (user.text.isNullOrBlank()) "" else "${java.net.URLEncoder.encode(user.text.toString(), "UTF-8")}:${java.net.URLEncoder.encode(password.text.toString(), "UTF-8")}@"
+                    values["MONGODB_URI"] = "mongodb://$credentials${host.text.toString().trim()}:${port.text.toString().trim()}/$dbName"
+                }
+                val keys = values.keys
+                val remaining = env.filterNot { line -> keys.any { line.trim().startsWith("$it=") } }
+                val escaped = values.map { (k, v) -> "$k=${v.replace("\\", "\\\\").replace("\n", "")}" }
+                runCatching { root.mkdirs(); envFile.writeText((remaining + escaped).joinToString("\n") + "\n") }
+                    .onSuccess { note("Database settings saved to ${envFile.name}. Restart the backend to apply them."); databaseError = "Settings saved. Tap Refresh tables to connect."; databaseAction = "tables"; render() }
+                    .onFailure { note("Could not save database settings: ${it.message}") }
+            }.show()
     }
 
     private fun databaseRowsScreen() {

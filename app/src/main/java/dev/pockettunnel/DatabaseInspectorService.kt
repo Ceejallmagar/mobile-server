@@ -64,7 +64,7 @@ class DatabaseInspectorService : Service() {
         val url = env["DATABASE_URL"] ?: env["DATABASE_URI"] ?: env["DB_URL"] ?: env["MYSQL_URL"] ?: env["PG_URL"] ?: env["SQLITE_URL"] ?: ""
         val type = (env["DB_TYPE"] ?: env["DB_DIALECT"] ?: env["DATABASE_CLIENT"] ?: "").lowercase()
         val provider = when {
-            (env["MONGODB_URI"] ?: env["MONGO_URI"] ?: url).startsWith("mongodb", true) -> "MongoDB"
+            (env["MONGODB_URI"] ?: env["MONGO_URI"] ?: url).startsWith("mongodb", true) || type.contains("mongo") -> "MongoDB"
             url.startsWith("postgres://", true) || url.startsWith("postgresql://", true) || type.contains("postgres") || type == "pg" -> "PostgreSQL"
             url.startsWith("mysql://", true) || url.startsWith("mariadb://", true) || type.contains("mysql") || type.contains("maria") -> "MySQL"
             url.startsWith("file:", true) || url.startsWith("sqlite:", true) || type.contains("sqlite") || env["DB_PATH"] != null || env["SQLITE_PATH"] != null || env["DB_FILE"] != null || env["SQLITE_URL"] != null -> "SQLite"
@@ -77,7 +77,7 @@ class DatabaseInspectorService : Service() {
             url.startsWith("sqlite:", true) -> url.substringAfter(':')
             else -> ""
         }.substringBefore('?')
-        val configured = env["DB_PATH"] ?: env["SQLITE_PATH"] ?: env["DB_FILE"] ?: pathFromUrl
+        val configured = env["DB_PATH"] ?: env["SQLITE_PATH"] ?: env["DB_FILE"] ?: pathFromUrl.ifBlank { env["DB_NAME"].orEmpty() }
         require(configured.isNotBlank()) { "Set DB_PATH or DATABASE_URL=file:... for SQLite." }
         return DatabaseSource(provider, configured)
     }
