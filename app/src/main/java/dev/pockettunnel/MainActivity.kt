@@ -10,17 +10,22 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.graphics.Color
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.view.Gravity
 import android.view.View
 import android.widget.*
 import java.io.File
 import java.io.FileOutputStream
 import java.net.HttpURLConnection
+import java.net.InetSocketAddress
+import java.net.ServerSocket
 import java.net.URL
 import java.text.DateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.UUID
+import java.util.zip.ZipFile
 import java.util.zip.ZipInputStream
 import org.json.JSONArray
 import org.json.JSONObject
@@ -49,6 +54,67 @@ class MainActivity : Activity() {
     private var databaseSchema = ""
     private var databaseTable = ""
     private var databaseRequestId = ""
+    private var statusMessage = ""
+    private var statusBusy = false
+    private var statusView: View? = null
+    private var screenRoot: android.widget.FrameLayout? = null
+    private var localDatabaseRunning = false
+    private var lastMariaStatusAt = 0L
+    private val runtimeStatusTimes = mutableMapOf<String, Long>()
+    private val liveRefreshHandler = Handler(Looper.getMainLooper())
+    private val liveRefreshTask = object : Runnable {
+        override fun run() {
+            if (isFinishing) return
+            val before = RunStatus.all()
+            val now = System.currentTimeMillis()
+            runtimeStatusTimes.filterValues { now - it > 12_000L }.keys.toList().forEach { key ->
+                RunStatus.remove(key)
+                runtimeStatusTimes.remove(key)
+            }
+            clearStaleRuntimeNotification()
+            val oldDatabaseState = localDatabaseRunning
+            refreshDatabasePortState()
+            if (screen in setOf("home", "detail", "database_hub") && (before != RunStatus.all() || oldDatabaseState != localDatabaseRunning)) render()
+            liveRefreshHandler.postDelayed(this, 3_000L)
+        }
+    }
+    private var localDatabaseAdminConfigured = false
+    private var localDatabases = emptyList<String>()
+    private var databaseListLoading = false
+    private var databaseListLoaded = false
+    private var databaseListError = ""
+    private var lastMariaStatusRequest = 0L
+    private var databaseStatusChecking = false
+    private val mariaReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            val previousRunning = localDatabaseRunning
+            val previousAdminConfigured = localDatabaseAdminConfigured
+            val progress = intent?.getBooleanExtra(MariaDbService.EXTRA_PROGRESS, false) == true
+            val statusOnly = intent?.getBooleanExtra(MariaDbService.EXTRA_STATUS_ONLY, false) == true
+            if (!progress) {
+                localDatabaseRunning = intent?.getBooleanExtra(MariaDbService.EXTRA_RUNNING, false) == true
+                databaseStatusChecking = false
+                lastMariaStatusAt = System.currentTimeMillis()
+            }
+            if (intent?.hasExtra(MariaDbService.EXTRA_ADMIN_CONFIGURED) == true) {
+                localDatabaseAdminConfigured = intent.getBooleanExtra(MariaDbService.EXTRA_ADMIN_CONFIGURED, false)
+                prefs.edit().putBoolean("mariadb_admin_configured", localDatabaseAdminConfigured).apply()
+            }
+            val message = intent?.getStringExtra(MariaDbService.EXTRA_MESSAGE).orEmpty()
+            if (intent?.hasExtra(MariaDbService.EXTRA_DATABASES) == true) {
+                databaseListLoading = false
+                databaseListLoaded = true
+                localDatabases = intent.getStringArrayExtra(MariaDbService.EXTRA_DATABASES)?.toList().orEmpty()
+                databaseListError = if (intent.getBooleanExtra(MariaDbService.EXTRA_OK, false)) "" else message
+            } else if (intent?.getBooleanExtra(MariaDbService.EXTRA_OK, false) == true && localDatabaseRunning) {
+                databaseListLoaded = false
+                databaseListError = ""
+            }
+            if (progress) showStatusOverlay(message, true) else if (!statusOnly) note(message)
+            if ((!statusOnly || previousRunning != localDatabaseRunning || previousAdminConfigured != localDatabaseAdminConfigured) &&
+                (screen == "database_hub" || screen == "home")) render()
+        }
+    }
     private val green = Color.rgb(38, 102, 69)
     private val ink = Color.rgb(28, 43, 35)
     private val muted = Color.rgb(112, 127, 117)
@@ -62,13 +128,20 @@ class MainActivity : Activity() {
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             val key = intent?.getStringExtra(RuntimeService.KEY) ?: return
+            val name = intent.getStringExtra(RuntimeService.NAME) ?: key
+            val snapshot = RuntimeSnapshot(
+                name,
+                intent.getStringExtra(RuntimeService.SERVER_STATE) ?: "stopped",
+                intent.getStringExtra(RuntimeService.TUNNEL_STATE) ?: "stopped")
+            val previous = RunStatus.snapshot(key)
+            RunStatus.put(key, name, snapshot.server, snapshot.tunnel)
+            runtimeStatusTimes[key] = System.currentTimeMillis()
             if (intent.getStringExtra(RuntimeService.STATE) == RuntimeService.STATE_RUNNING) {
-                RunStatus.put(key, intent.getStringExtra(RuntimeService.NAME) ?: key)
+                // Keep the runtime slot claimed while either component remains active.
             } else {
-                RunStatus.remove(key)
                 RunSlots.release(this@MainActivity, key)
             }
-            render()
+            if (previous != snapshot) render()
         }
     }
 
@@ -105,16 +178,36 @@ class MainActivity : Activity() {
             )
         }
         store.migrateLegacy(prefs, secrets)
+        localDatabaseRunning = databasePortResponds()
+        lastMariaStatusAt = getSharedPreferences("mariadb_status", MODE_PRIVATE).getLong("heartbeat", 0L)
+        localDatabaseAdminConfigured = prefs.getBoolean("mariadb_admin_configured", false)
         RunStatus.seed(this)
+        RunStatus.all().keys.forEach { runtimeStatusTimes[it] = System.currentTimeMillis() }
         registerReceiver(receiver, IntentFilter(RuntimeService.BROADCAST))
         registerReceiver(databaseReceiver, IntentFilter(DatabaseInspectorService.ACTION_RESULT))
+        registerReceiver(mariaReceiver, IntentFilter(MariaDbService.ACTION_RESULT))
         render()
     }
 
     override fun onDestroy() {
+        liveRefreshHandler.removeCallbacks(liveRefreshTask)
         runCatching { unregisterReceiver(receiver) }
         runCatching { unregisterReceiver(databaseReceiver) }
+        runCatching { unregisterReceiver(mariaReceiver) }
         super.onDestroy()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        refreshDatabasePortState()
+        if (::body.isInitialized && screen in setOf("home", "detail", "database_hub")) render()
+        liveRefreshHandler.removeCallbacks(liveRefreshTask)
+        liveRefreshHandler.postDelayed(liveRefreshTask, 3_000L)
+    }
+
+    override fun onPause() {
+        liveRefreshHandler.removeCallbacks(liveRefreshTask)
+        super.onPause()
     }
 
     @Deprecated("Deprecated in Java")
@@ -124,6 +217,7 @@ class MainActivity : Activity() {
                 "wizard" -> if (editingComplete) "detail" else "home"
                 "detail" -> "home"
                 "files", "databases" -> "detail"
+                "database_hub" -> "home"
                 "file_preview" -> "files"
                 "database_rows" -> "databases"
                 else -> "home"
@@ -141,7 +235,11 @@ class MainActivity : Activity() {
         scroll.addView(body)
         root.addView(header(), LinearLayout.LayoutParams(-1, dp(60)))
         root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
-        setContentView(root)
+        val frame = android.widget.FrameLayout(this)
+        frame.addView(root)
+        screenRoot = frame
+        setContentView(frame)
+        if (statusMessage.isNotBlank()) showStatusOverlay(statusMessage, statusBusy)
         when (screen) {
             "home" -> homeScreen()
             "profile" -> profileScreen()
@@ -150,6 +248,7 @@ class MainActivity : Activity() {
             "files" -> projectFilesScreen()
             "file_preview" -> projectFilePreviewScreen()
             "databases" -> databaseScreen()
+            "database_hub" -> databaseHubScreen()
             "database_rows" -> databaseRowsScreen()
         }
     }
@@ -171,6 +270,7 @@ class MainActivity : Activity() {
                     "files" -> "‹  ${store.get(detailId)?.name ?: "Project"}"
                     "file_preview" -> "‹  Project files"
                     "databases" -> "‹  ${store.get(detailId)?.name ?: "Database"}"
+                    "database_hub" -> "‹  Tunnels"
                     "database_rows" -> "‹  Tables"
                     else -> "‹  Tunnels"
                 }
@@ -187,6 +287,7 @@ class MainActivity : Activity() {
         when (screen) {
             "wizard" -> screen = if (editingComplete) "detail" else "home"
             "files", "databases" -> screen = "detail"
+            "database_hub" -> screen = "home"
             "file_preview" -> screen = "files"
             "database_rows" -> screen = "databases"
             else -> screen = "home"
@@ -200,7 +301,7 @@ class MainActivity : Activity() {
     private fun homeScreen() {
         text(body, "POCKET TUNNEL  ·  ANDROID", 11, green, true, 0, 8)
         text(body, "Your tunnels", 28, ink, true, 0, 8)
-        text(body, "Create, run, edit and delete Node.js tunnels from this phone.", 13, muted, false, 0, 17)
+        text(body, "Run a Node.js backend or host a built frontend site from this phone.", 13, muted, false, 0, 17)
         accountStrip()
         val tunnels = store.all().sortedByDescending { it.createdAt }
         if (tunnels.isEmpty()) {
@@ -209,8 +310,313 @@ class MainActivity : Activity() {
             text(body, "${tunnels.size} tunnel${if (tunnels.size == 1) "" else "s"}  ·  ${RunStatus.runningCount()} running", 12, muted, true, 17, 10)
             tunnels.forEach { tunnel -> tunnelCard(tunnel) }
         }
-        button("+ New tunnel", true) { openWizard(null) }
+        button("+ New backend tunnel", true) { openWizard(null, frontend = false) }
+        button("+ New frontend site", false) { openWizard(null, frontend = true) }
+        button(if (localDatabaseRunning) "Database · MariaDB running · 127.0.0.1:3306" else "Database · MariaDB stopped", false) { screen = "database_hub"; render() }
         caption("Everything is saved on this phone. Tap a tunnel for details, start, edit or delete.")
+    }
+
+    private fun databasePortResponds(): Boolean = runCatching {
+        val status = getSharedPreferences("mariadb_status", MODE_PRIVATE)
+        status.getBoolean("running", false) && System.currentTimeMillis() - status.getLong("heartbeat", 0L) <= 12_000L
+    }.getOrDefault(false)
+
+    private fun refreshDatabasePortState() {
+        if (lastMariaStatusAt == 0L) {
+            val status = getSharedPreferences("mariadb_status", MODE_PRIVATE)
+            lastMariaStatusAt = status.getLong("heartbeat", 0L)
+            localDatabaseRunning = status.getBoolean("running", false) && System.currentTimeMillis() - lastMariaStatusAt <= 12_000L
+        } else if (System.currentTimeMillis() - lastMariaStatusAt > 12_000L) {
+            localDatabaseRunning = false
+        }
+        if (!localDatabaseRunning && !databaseStatusChecking) getSystemService(android.app.NotificationManager::class.java).cancel(74)
+        val configured = getSharedPreferences("mariadb_status", MODE_PRIVATE).getBoolean("admin_configured", false)
+        if (configured) {
+            localDatabaseAdminConfigured = true
+            prefs.edit().putBoolean("mariadb_admin_configured", true).apply()
+        } else {
+            localDatabaseAdminConfigured = prefs.getBoolean("mariadb_admin_configured", false)
+        }
+    }
+
+    private fun clearStaleRuntimeNotification() {
+        if (RunStatus.all().isEmpty()) getSystemService(android.app.NotificationManager::class.java).cancel(27)
+    }
+
+    private fun statusActive(value: String): Boolean =
+        !value.startsWith("stopped", true) && !value.startsWith("failed", true)
+
+    private fun availableProjectPort(preferred: Int, excludingId: String): Int? {
+        val reserved = store.all().filter { it.id != excludingId }.mapNotNull { it.port.toIntOrNull() }.toSet()
+        val candidates = sequenceOf(preferred) + (3000..3999).asSequence()
+        return candidates.distinct().firstOrNull { port ->
+            port in 1..65535 && port != 3306 && port !in reserved && runCatching {
+                ServerSocket().use { socket ->
+                    socket.reuseAddress = false
+                    socket.bind(InetSocketAddress("127.0.0.1", port))
+                }
+                true
+            }.getOrDefault(false)
+        }
+    }
+
+    private fun prepareTunnelPort(tunnel: TunnelProfile, onReady: () -> Unit) {
+        val runtime = RunStatus.snapshot(tunnel.id)
+        if (runtime?.server?.let(::statusActive) == true) {
+            note("This project's server is already running on port ${tunnel.port}. Stop it before assigning it a different port.")
+            return
+        }
+        val current = tunnel.port.toIntOrNull() ?: 3000
+        val selected = availableProjectPort(current, tunnel.id)
+        if (selected == null) { note("No free project port is available. Stop another listener or choose a different port range."); return }
+        if (selected == current) { onReady(); return }
+        val apiToken = secrets.get("api-token")
+        if (tunnel.tunnelId.isBlank() || tunnel.hostname.isBlank() || apiToken.isNullOrBlank()) {
+            note("Port $current is busy. Edit the tunnel, choose port $selected, then apply the tunnel config before starting it.")
+            return
+        }
+        cloudflareAction("Port $current is busy. Updating this tunnel to port $selected…", {
+            CloudflareApi(apiToken).configureHostname(tunnel.accountId.ifBlank { accountId }, tunnel.tunnelId, tunnel.hostname, selected)
+            val configFile = store.configSnapshotOf(tunnel)
+            configFile.parentFile?.mkdirs()
+            configFile.writeText("tunnel: ${tunnel.tunnelId}\ningress:\n  - hostname: ${tunnel.hostname}\n    service: http://127.0.0.1:$selected\n  - service: http_status:404\n")
+            tunnel.port = selected.toString()
+            tunnel.configApplied = true
+            store.save(tunnel)
+        }) { failure ->
+            if (failure == null) {
+                note("Port $current was occupied. The project and Cloudflare route now use port $selected.")
+                onReady()
+            }
+        }
+    }
+
+    private fun databaseHubScreen() {
+        refreshDatabasePortState()
+        requestMariaDbStatus()
+        text(body, "DATABASES", 11, green, true, 0, 8)
+        text(body, "On-device MySQL", 26, ink, true, 0, 6)
+        text(body, "MariaDB runs on this phone. Create multiple databases, view them here, then connect each one to a backend project.", 13, muted, false, 0, 14)
+        statusPill(when {
+            databaseStatusChecking -> "Checking MariaDB status…"
+            localDatabaseRunning -> "MariaDB running · 127.0.0.1:3306"
+            else -> "MariaDB stopped"
+        }, if (localDatabaseRunning) running else muted)
+        button(when {
+            databaseStatusChecking -> "Checking database server…"
+            !localDatabaseAdminConfigured -> "Set admin password and start database"
+            localDatabaseRunning -> "Stop database server"
+            else -> "Start database server"
+        }, !localDatabaseRunning && !databaseStatusChecking) {
+            if (databaseStatusChecking) return@button
+            if (!localDatabaseAdminConfigured) {
+                showAdminPasswordSetup()
+                return@button
+            }
+            val action = if (localDatabaseRunning) MariaDbService.ACTION_STOP else MariaDbService.ACTION_START
+            databaseStatusChecking = true
+            startForegroundServiceCompat(Intent(this, MariaDbService::class.java).setAction(action))
+            showStatusOverlay(if (localDatabaseRunning) "Stopping MariaDB…" else "Starting MariaDB…", true)
+        }
+        card("MariaDB administrator · root")
+        text(body, if (localDatabaseAdminConfigured) "Username: root. Its password is saved encrypted on this phone. Projects use their own database users." else "Username: root. Choose its password now; Pocket Tunnel will save it encrypted so it can manage your databases.", 12, muted, false, 0, 8)
+        button(if (localDatabaseAdminConfigured) "Change administrator password" else "Set administrator password", false) { showAdminPasswordSetup() }
+        card("Your databases on this phone")
+        if (!localDatabaseRunning) {
+            text(body, "Start MariaDB to load your database list.", 12, muted, false, 0, 8)
+        } else if (!localDatabaseAdminConfigured) {
+            text(body, "Set the administrator password above to manage databases.", 12, muted, false, 0, 8)
+        } else {
+            if (!databaseListLoaded && !databaseListLoading) requestLocalDatabaseList()
+            if (databaseListLoading) loadingRow("Loading databases")
+            if (databaseListError.isNotBlank()) text(body, databaseListError, 12, alert, false, 0, 8)
+            if (databaseListLoaded && localDatabases.isEmpty() && databaseListError.isBlank()) {
+                text(body, "No databases yet. Create your first one below.", 12, muted, false, 0, 8)
+            }
+            localDatabases.forEach { name ->
+                val item = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    setPadding(dp(13), dp(11), dp(13), dp(10))
+                    setBackgroundColor(Color.WHITE)
+                }
+                item.addView(TextView(this).apply { text = name; textSize = 15f; setTextColor(ink); setTypeface(null, 1) })
+                item.addView(TextView(this).apply { text = "MariaDB · 127.0.0.1:3306"; textSize = 11f; setTextColor(muted); setPadding(0, dp(3), 0, 0) })
+                item.addView(TextView(this).apply {
+                    text = "Connect to a project  →"; textSize = 12f; setTextColor(green); setTypeface(null, 1); setPadding(0, dp(9), 0, 0)
+                    setOnClickListener { connectExistingDatabase(name) }
+                })
+                item.addView(TextView(this).apply {
+                    text = "Delete database"; textSize = 12f; setTextColor(alert); setPadding(0, dp(8), 0, 0)
+                    setOnClickListener { confirmDeleteDatabase(name) }
+                })
+                body.addView(item, match(6))
+            }
+            button("Refresh database list", false) {
+                databaseListLoaded = false
+                databaseListError = ""
+                requestLocalDatabaseList()
+            }
+        }
+        card("Create a database and project user")
+        text(body, "Each database gets its own username and password. Credentials are kept encrypted by the app so you can reconnect it to another project later.", 12, muted, false, 0, 8)
+        val tunnels = store.all().filterNot { it.frontend }.sortedBy { it.name.lowercase(Locale.US) }
+        if (tunnels.isEmpty()) {
+            card("No projects yet")
+            caption("Create a tunnel and add a backend project first.")
+            button("Create project", true) { openWizard(null) }
+        } else {
+            val projectPicker = Spinner(this)
+            projectPicker.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, tunnels.map { "${it.name} · ${it.projectName}" })
+            body.addView(projectPicker, match(5))
+            val dbName = input("Database name", "appdb")
+            val username = input("Database username", "appuser")
+            val password = input("Database password", "").apply { inputType = 129 }
+            val show = CheckBox(this).apply { text = "Show password"; setTextColor(ink); setOnCheckedChangeListener { _, checked -> password.inputType = if (checked) 1 else 129; password.setSelection(password.text.length) } }
+            body.addView(show, match(8))
+            button("Create database and connect project", true) {
+                if (!localDatabaseAdminConfigured) { showAdminPasswordSetup(); return@button }
+                val selected = tunnels.getOrNull(projectPicker.selectedItemPosition) ?: return@button
+                val projectRoot = databaseWorkingDirectory(selected)
+                if (!projectRoot.isDirectory) { note("Extract the backend ZIP first, then create its database."); return@button }
+                val db = dbName.text.toString().trim()
+                val user = username.text.toString().trim()
+                val pass = password.text.toString()
+                showStatusOverlay("Creating '$db' and connecting ${selected.projectName}…", true)
+                startForegroundServiceCompat(Intent(this, MariaDbService::class.java).setAction(MariaDbService.ACTION_CREATE)
+                    .putExtra(MariaDbService.EXTRA_DB_NAME, db)
+                    .putExtra(MariaDbService.EXTRA_DB_USER, user)
+                    .putExtra(MariaDbService.EXTRA_DB_PASSWORD, pass)
+                    .putExtra(MariaDbService.EXTRA_PROJECT_ROOT, projectRoot.absolutePath))
+            }
+            tunnels.forEach { tunnel ->
+                button("Manage ${tunnel.projectName} tables and SQL", false) { openDatabaseManager(tunnel) }
+            }
+        }
+        caption("Backend projects need mysql2 in node_modules and should read DATABASE_URL or DB_HOST/DB_PORT from .env. The database server only listens on this phone's loopback address.")
+    }
+
+    private fun requestMariaDbStatus() {
+        val now = System.currentTimeMillis()
+        if (now - lastMariaStatusRequest < 8_000L) return
+        lastMariaStatusRequest = now
+        databaseStatusChecking = true
+        startForegroundServiceCompat(Intent(this, MariaDbService::class.java).setAction(MariaDbService.ACTION_STATUS))
+    }
+
+    private fun requestLocalDatabaseList() {
+        if (databaseListLoading) return
+        databaseListLoading = true
+        startForegroundServiceCompat(Intent(this, MariaDbService::class.java).setAction(MariaDbService.ACTION_LIST))
+    }
+
+    private fun showAdminPasswordSetup() {
+        val panel = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(8), dp(4), dp(8), dp(4)) }
+        text(panel, "Administrator username: root. This password manages MariaDB on this phone; it is separate from each project's database username/password.", 12, muted, false, 0, 9)
+        val password = EditText(this).apply {
+            hint = "MariaDB administrator password"
+            inputType = 129
+            setSingleLine(true)
+            textSize = 14f
+            setPadding(dp(13), dp(12), dp(13), dp(12))
+            setBackgroundColor(Color.WHITE)
+        }
+        panel.addView(password, match(6))
+        val show = CheckBox(this).apply {
+            text = "Show password"; setTextColor(ink)
+            setOnCheckedChangeListener { _, checked ->
+                password.inputType = if (checked) 1 else 129
+                password.setSelection(password.text.length)
+            }
+        }
+        panel.addView(show, match(2))
+        AlertDialog.Builder(this)
+            .setTitle(if (localDatabaseAdminConfigured) "Change administrator password" else "Set up MariaDB")
+            .setMessage("Pocket Tunnel will remember this password encrypted on this phone.")
+            .setView(panel)
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton(if (localDatabaseRunning) "Save password" else "Save and start", null)
+            .create().also { dialog ->
+                dialog.setOnShowListener {
+                    dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                        val value = password.text.toString()
+                        if (value.length < 8) { note("Use an administrator password with at least 8 characters."); return@setOnClickListener }
+                        showStatusOverlay("Setting up MariaDB administrator…", true)
+                        startForegroundServiceCompat(Intent(this, MariaDbService::class.java)
+                            .setAction(MariaDbService.ACTION_START)
+                            .putExtra(MariaDbService.EXTRA_ADMIN_PASSWORD, value))
+                        dialog.dismiss()
+                    }
+                }
+                dialog.show()
+            }
+    }
+
+    private fun connectExistingDatabase(database: String) {
+        val tunnels = store.all().filterNot { it.frontend }.sortedBy { it.name.lowercase(Locale.US) }
+        if (tunnels.isEmpty()) { note("Create a project before connecting a database."); return }
+        val savedUser = secrets.get("local-db-user:$database").orEmpty()
+        val savedPassword = secrets.get("local-db-password:$database").orEmpty()
+        val panel = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(8), dp(4), dp(8), dp(4)) }
+        text(panel, "Backend project", 12, ink, true, 9, 5)
+        val projectPicker = Spinner(this).apply {
+            adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, tunnels.map { "${it.name} · ${it.projectName}" })
+        }
+        panel.addView(projectPicker, match(5))
+        fun dialogField(label: String, value: String, type: Int = 1) = EditText(this).apply {
+            hint = label; setSingleLine(true); textSize = 14f; inputType = type
+            setTextColor(ink); setHintTextColor(muted); setText(value); setPadding(dp(13), dp(12), dp(13), dp(12)); setBackgroundColor(Color.WHITE)
+        }
+        val username = dialogField("Database username", savedUser)
+        text(panel, "Database username", 12, ink, true, 9, 5)
+        panel.addView(username, match(5))
+        val password = dialogField("Database password", savedPassword, 129)
+        text(panel, "Database password", 12, ink, true, 9, 5)
+        panel.addView(password, match(5))
+        val showPassword = CheckBox(this).apply {
+            text = "Show password"; setTextColor(ink)
+            setOnCheckedChangeListener { _, checked -> password.inputType = if (checked) 1 else 129; password.setSelection(password.text.length) }
+        }
+        panel.addView(showPassword, match(3))
+        val remember = CheckBox(this).apply { text = "Remember credentials on this phone"; isChecked = true; setTextColor(ink) }
+        panel.addView(remember, match(3))
+        AlertDialog.Builder(this).setTitle("Connect $database")
+            .setMessage("Choose a backend project. Enter the database login, or leave both fields blank to use a saved login.")
+            .setView(panel).setNegativeButton("Cancel", null)
+            .setPositiveButton("Connect project", null)
+            .create().also { dialog ->
+                dialog.setOnShowListener {
+                    dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                        val selected = tunnels.getOrNull(projectPicker.selectedItemPosition) ?: return@setOnClickListener
+                        val root = databaseWorkingDirectory(selected)
+                        if (!root.isDirectory) { note("Extract this project's backend ZIP first."); return@setOnClickListener }
+                        val user = username.text.toString().trim()
+                        val pass = password.text.toString()
+                        if (user.isBlank() != pass.isBlank()) { note("Enter both the database username and password, or leave both blank to use saved credentials."); return@setOnClickListener }
+                        startForegroundServiceCompat(Intent(this, MariaDbService::class.java).setAction(MariaDbService.ACTION_CONNECT)
+                            .putExtra(MariaDbService.EXTRA_DB_NAME, database)
+                            .putExtra(MariaDbService.EXTRA_DB_USER, user)
+                            .putExtra(MariaDbService.EXTRA_DB_PASSWORD, pass)
+                            .putExtra(MariaDbService.EXTRA_PROJECT_ROOT, root.absolutePath)
+                            .putExtra(MariaDbService.EXTRA_REMEMBER, remember.isChecked))
+                        showStatusOverlay("Connecting $database to ${selected.projectName}…", true)
+                        dialog.dismiss()
+                    }
+                }
+                dialog.show()
+            }
+    }
+
+    private fun confirmDeleteDatabase(database: String) {
+        AlertDialog.Builder(this)
+            .setTitle("Delete $database?")
+            .setMessage("This permanently deletes the database and all its tables and data from this phone. Projects configured to use it will stop working.")
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Delete database") { _, _ ->
+                showStatusOverlay("Deleting $database…", true)
+                startForegroundServiceCompat(Intent(this, MariaDbService::class.java).setAction(MariaDbService.ACTION_DELETE)
+                    .putExtra(MariaDbService.EXTRA_DB_NAME, database))
+            }
+            .show()
     }
 
     private fun accountStrip() {
@@ -231,7 +637,7 @@ class MainActivity : Activity() {
         val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(15), dp(14), dp(15), dp(14)); setBackgroundColor(Color.WHITE) }
         box.addView(TextView(this).apply { text = "No tunnels yet"; textSize = 14f; setTextColor(ink); setTypeface(null, 1) })
         box.addView(TextView(this).apply {
-            text = "A tunnel serves one Node.js backend through its own Cloudflare hostname. You can run several tunnels at the same time."
+            text = "A tunnel can serve one Node.js backend or one static frontend through its own Cloudflare hostname. You can run several tunnels at the same time."
             textSize = 12f; setTextColor(muted); setPadding(0, dp(6), 0, 0)
         })
         body.addView(box, match(10))
@@ -245,8 +651,9 @@ class MainActivity : Activity() {
         val statusRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
         statusRow.addView(TextView(this).apply { text = tunnel.name; textSize = 15f; setTextColor(ink); setTypeface(null, 1) })
         statusRow.addView(TextView(this).apply {
-            text = if (RunStatus.isRunning(tunnel.id)) "   ● Running" else if (tunnel.complete) "   ○ Stopped" else "   ● Setup incomplete"
-            textSize = 11f; setTextColor(if (RunStatus.isRunning(tunnel.id)) running else if (tunnel.complete) muted else alert); setTypeface(null, 1)
+            val state = RunStatus.snapshot(tunnel.id)
+            text = if (state == null && !tunnel.complete) "   ● Setup incomplete" else if (state?.active == true) "   ● Active" else "   ○ Stopped"
+            textSize = 11f; setTextColor(if (state?.active == true) running else if (tunnel.complete) muted else alert); setTypeface(null, 1)
         }, LinearLayout.LayoutParams(0, -2, 1f))
         card.addView(statusRow)
         card.addView(TextView(this).apply {
@@ -257,9 +664,15 @@ class MainActivity : Activity() {
             textSize = 12f; setTextColor(if (tunnel.hostname.isBlank()) muted else green); setPadding(0, dp(4), 0, 0)
         })
         card.addView(TextView(this).apply {
-            text = "Port ${tunnel.port}  ·  ${tunnel.entry}  ·  ${tunnel.projectName}"
+            text = if (tunnel.frontend) "Frontend · port ${tunnel.port} · ${tunnel.webRoot} · ${tunnel.projectName}" else "Port ${tunnel.port}  ·  ${tunnel.entry}  ·  ${tunnel.projectName}"
             textSize = 11f; setTextColor(muted); setPadding(0, dp(3), 0, 0)
         })
+        RunStatus.snapshot(tunnel.id)?.let { state ->
+            card.addView(TextView(this).apply {
+                text = "Server: ${state.server}  ·  Tunnel: ${state.tunnel}"
+                textSize = 10f; setTextColor(muted); setPadding(0, dp(5), 0, 0)
+            })
+        }
         body.addView(card, match(10))
     }
 
@@ -299,7 +712,7 @@ class MainActivity : Activity() {
         val tunnel = draft ?: return
         val page = tunnel.page.coerceIn(0, 6)
         text(body, "POCKET TUNNEL  ·  ANDROID", 11, green, true, 0, 8)
-        val titles = listOf("Add your backend", "Choose how it starts", "Connect Cloudflare", "Create your tunnel", "Create the subdomain", "Write the tunnel config", "Start your backend")
+        val titles = listOf(if (tunnel.frontend) "Add your frontend site" else "Add your backend", if (tunnel.frontend) "Choose your site folder" else "Choose how it starts", "Connect Cloudflare", "Create your tunnel", "Create the subdomain", "Write the tunnel config", if (tunnel.frontend) "Start your frontend" else "Start your backend")
         text(body, titles[page], 28, ink, true, 0, 8)
         text(body, if (editingComplete) "Editing ${tunnel.name}" else "Step ${page + 1} of 7", 12, muted, false, 0, 17)
         progress(page)
@@ -318,10 +731,10 @@ class MainActivity : Activity() {
 
     private fun projectPage(tunnel: TunnelProfile) {
         card("This runs on your phone")
-        text(body, "Your Android phone runs the Node backend locally. Cloudflare Tunnel gives it a public hostname and forwards requests back to the phone.", 14, muted, false, 0, 15)
+        text(body, if (tunnel.frontend) "Host a built website directly from this phone. Pocket Tunnel serves the files for you; no Node server code is needed." else "Your Android phone runs the Node backend locally. Cloudflare Tunnel gives it a public hostname and forwards requests back to the phone.", 14, muted, false, 0, 15)
         val name = input("Project name", tunnel.projectName)
         val file = TextView(this).apply {
-            text = if (tunnel.zipPath.isBlank()) "Choose backend ZIP  →" else "ZIP selected: ${tunnel.zipName}  ·  Change"
+            text = if (tunnel.zipPath.isBlank()) "Choose ${if (tunnel.frontend) "frontend" else "backend"} ZIP  →" else "ZIP selected: ${tunnel.zipName}  ·  Change"
             textSize = 13f; setTextColor(green); setPadding(dp(14), dp(15), dp(14), dp(15)); setBackgroundColor(Color.WHITE); setOnClickListener { chooseZip() }
         }
         body.addView(file, match(12))
@@ -333,22 +746,26 @@ class MainActivity : Activity() {
             if (oldDir.exists() && oldDir.canonicalPath != newDir.canonicalPath) oldDir.renameTo(newDir)
             advance()
         }
-        caption("The ZIP is copied into this app's private storage and unpacked by the app. No terminal app is used.")
+        caption(if (tunnel.frontend) "Build your site on your computer first (for Vite, run npm run build), then ZIP the output containing index.html. The app extracts and hosts it." else "The ZIP is copied into this app's private storage and unpacked by the app. No terminal app is used.")
     }
 
     private fun runtimePage(tunnel: TunnelProfile) {
-        card("Set the local server details")
-        text(body, "These values are used in the tunnel config. Your backend must listen on 0.0.0.0 or localhost at this port.", 13, muted, false, 0, 10)
-        val portField = input("Backend port", tunnel.port)
-        val entryField = input("Node entry file", tunnel.entry)
+        card(if (tunnel.frontend) "Set the site details" else "Set the local server details")
+        text(body, if (tunnel.frontend) "Pocket Tunnel serves the built site on this port. It can find a dist, build, or root folder containing index.html." else "These values are used in the tunnel config. Your backend must listen on 0.0.0.0 or localhost at this port.", 13, muted, false, 0, 10)
+        val portField = input(if (tunnel.frontend) "Site port" else "Backend port", tunnel.port)
+        val entryField = if (tunnel.frontend) input("Built site folder", tunnel.webRoot) else input("Node entry file", tunnel.entry)
         button("Save and continue", true) {
             val p = portField.text.toString().toIntOrNull(); if (p == null || p !in 1..65535) { note("Enter a valid port from 1 to 65535."); return@button }
             val entry = entryField.text.toString().trim()
-            if (entry.isBlank() || entry.startsWith("/") || entry.split('/').any { it == ".." }) { note("Enter a safe project-relative Node entry file, such as server.js."); return@button }
-            tunnel.port = p.toString(); tunnel.entry = entry
+            if (entry.isBlank() || entry.startsWith("/") || entry.split('/').any { it == ".." }) { note(if (tunnel.frontend) "Enter a project-relative folder such as dist, build, or ." else "Enter a safe project-relative Node entry file, such as server.js."); return@button }
+            val availablePort = availableProjectPort(p, tunnel.id)
+            if (availablePort == null) { note("No free project port is available in 3000–3999. Stop another listener or choose a different range."); return@button }
+            tunnel.port = availablePort.toString()
+            if (tunnel.frontend) tunnel.webRoot = entry else tunnel.entry = entry
             advance()
+            if (availablePort != p) note("Port $p is already reserved or busy. Assigned port $availablePort to this project.")
         }
-        caption("The ZIP must include its dependencies in node_modules. The app runs the selected JavaScript file with embedded Node.js.")
+        caption(if (tunnel.frontend) "The folder must contain index.html and your built CSS, JavaScript, images, and other assets. The app serves these files directly." else "The ZIP must include its dependencies in node_modules. The app runs the selected JavaScript file with embedded Node.js.")
     }
 
     private fun loginPage(tunnel: TunnelProfile) {
@@ -442,28 +859,37 @@ class MainActivity : Activity() {
     }
 
     private fun startPage(tunnel: TunnelProfile) {
-        card("Run your backend and tunnel from this app")
-        text(body, "The APK runs Node.js and cloudflared itself. Android will show an ongoing notification while the services run. Keep the phone powered and online.", 13, muted, false, 0, 12)
+        card(if (tunnel.frontend) "Host your frontend and tunnel from this app" else "Run your backend and tunnel from this app")
+        text(body, if (tunnel.frontend) "Pocket Tunnel serves the built site directly. No server file or npm packages are needed. Keep the phone powered and online." else "The APK runs Node.js and cloudflared itself. Android will show an ongoing notification while the services run. Keep the phone powered and online.", 13, muted, false, 0, 12)
         text(body, "Project ZIP: ${tunnel.zipName.ifBlank { "not selected" }}", 12, ink, true, 0, 4)
-        button("Prepare project ZIP", false) {
+        button(if (tunnel.frontend) "Extract and find the site" else "Prepare project ZIP", false) {
             if (tunnel.zipPath.isBlank()) { chooseZip(); return@button }
             extractAndReport(tunnel)
         }
         button("Test local server  ·  port ${tunnel.port}", false) { testLocalServer(tunnel) }
-        button("Start backend  ·  port ${tunnel.port}", true) {
-            val dir = store.projectDirOf(tunnel)
-            val entryFile = File(dir, tunnel.entry).canonicalFile
-            if (!entryFile.path.startsWith(dir.canonicalPath + File.separator) || !entryFile.isFile) { note("Extract the ZIP and check the Node entry file path first."); return@button }
-            startBackendService(tunnel)
-            note("Starting the backend on port ${tunnel.port}.")
+        button("Start ${if (tunnel.frontend) "frontend site" else "backend"}  ·  port ${tunnel.port}", true) {
+            prepareTunnelPort(tunnel) {
+                if (tunnel.frontend) {
+                    val root = resolveFrontendRoot(store.projectDirOf(tunnel), tunnel.webRoot)
+                    if (root == null) { note("No index.html found. Extract the ZIP and set the site folder to dist, build, or the folder containing index.html."); return@prepareTunnelPort }
+                    startFrontendService(tunnel, root)
+                    note("Starting the frontend site on port ${tunnel.port}.")
+                } else {
+                    val dir = store.projectDirOf(tunnel)
+                    val entryFile = File(dir, tunnel.entry).canonicalFile
+                    if (!entryFile.path.startsWith(dir.canonicalPath + File.separator) || !entryFile.isFile) { note("Extract the ZIP and check the Node entry file path first."); return@prepareTunnelPort }
+                    startBackendService(tunnel)
+                    note("Starting the backend on port ${tunnel.port}.")
+                }
+            }
         }
         button("Start Cloudflare Tunnel", true) {
             val connectorToken = secrets.get("tunnel-token:${tunnel.id}")
             if (connectorToken.isNullOrBlank()) { note("Create the Cloudflare tunnel first."); return@button }
             startTunnelService(tunnel)
-            note("Starting the Cloudflare connector.")
+            note("Starting the local server first; Cloudflare will connect when port ${tunnel.port} responds.")
         }
-        button("View backend and tunnel output", false) { showBackendLog(tunnel) }
+        button("View ${if (tunnel.frontend) "frontend" else "backend"} and tunnel output", false) { showBackendLog(tunnel) }
         text(body, if (tunnel.hostname.isBlank()) "Your public address will appear here after you finish the hostname step." else "Public address: https://${tunnel.hostname}", 14, green, true, 0, 14)
         if (!tunnel.complete) {
             button("Save tunnel", true) { tunnel.complete = true; store.save(tunnel); openDetail(tunnel.id); note("Tunnel saved. You can start it any time from the tunnel list.") }
@@ -475,56 +901,84 @@ class MainActivity : Activity() {
 
     private fun detailScreen() {
         val tunnel = store.get(detailId) ?: run { screen = "home"; render(); return }
+        val detectedSiteFolder = if (!tunnel.frontend && tunnel.zipPath.isNotBlank()) inspectFrontendZip(File(tunnel.zipPath))?.first else null
         text(body, "POCKET TUNNEL  ·  ANDROID", 11, green, true, 0, 8)
         text(body, tunnel.name, 28, ink, true, 0, 8)
-        val isRunning = RunStatus.isRunning(tunnel.id)
-        text(body, if (isRunning) "● Running now" else if (tunnel.complete) "○ Stopped" else "● Setup incomplete", 13, if (isRunning) running else muted, true, 0, 17)
+        val runtime = RunStatus.snapshot(tunnel.id)
+        val isRunning = runtime?.active == true
+        text(body, if (isRunning) "● Runtime active" else if (tunnel.complete) "○ Stopped" else "● Setup incomplete", 13, if (isRunning) running else muted, true, 0, 17)
         card("Public address")
         rowCopy("URL", if (tunnel.hostname.isBlank()) "Hostname not set yet" else "https://${tunnel.hostname}", "URL")
-        card("Backend")
-        rowCopy("Node entry file", tunnel.entry, "Entry file")
+        if (detectedSiteFolder != null) {
+            card("Built frontend files found in this ZIP")
+            text(body, "The JSON ‘Route not found: GET /’ page is your backend API responding at `/`. Switching this tunnel to frontend hosting will serve the built index.html site here; API routes from the backend will no longer be served by this tunnel.", 12, muted, false, 0, 4)
+            button("Switch this project to frontend hosting", true) {
+                tunnel.frontend = true
+                tunnel.webRoot = detectedSiteFolder
+                store.save(tunnel)
+                render()
+                note("Converted to frontend hosting. Extract the ZIP, start the frontend server, then start the tunnel.")
+            }
+        }
+        card(if (tunnel.frontend) "Frontend site" else "Backend")
+        if (tunnel.frontend) row("Site folder", tunnel.webRoot) else rowCopy("Node entry file", tunnel.entry, "Entry file")
         rowCopy("Local port", tunnel.port, "Port")
         row("Project folder", tunnel.projectName)
         row("Working directory", store.projectDirOf(tunnel).absolutePath)
-        row("Backend ZIP", tunnel.zipName.ifBlank { "not selected" })
+        row(if (tunnel.frontend) "Frontend ZIP" else "Backend ZIP", tunnel.zipName.ifBlank { "not selected" })
         card("Project tools")
         button("Browse extracted project files", false) { openProjectFiles(tunnel) }
-        button("Database manager", false) { openDatabaseManager(tunnel) }
-        caption("Browse every extracted file or inspect the database configured for this backend.")
+        if (!tunnel.frontend) button("Database manager", false) { openDatabaseManager(tunnel) }
+        caption(if (tunnel.frontend) "Browse the extracted site files." else "Browse every extracted file or inspect the database configured for this backend.")
         card("Cloudflare tunnel")
         rowCopy("Tunnel ID", tunnel.tunnelId.ifBlank { "not created yet" }, "Tunnel ID")
         row("DNS zone", tunnel.zoneName.ifBlank { "not routed yet" })
         rowCopy("Account ID", tunnel.accountId.ifBlank { accountId }, "Account ID")
         row("Created", DateFormat.getDateTimeInstance().format(Date(tunnel.createdAt)))
+        card("Live service state")
+        row(if (tunnel.frontend) "Frontend server" else "Backend server", runtime?.server ?: "stopped")
+        row("Cloudflare tunnel", runtime?.tunnel ?: "stopped")
         gap(body, 6)
-        if (isRunning) {
-            button("Stop tunnel", true) { stopTunnel(tunnel); note("Stopping ${tunnel.name} on this phone.") }
-            button("Test local server  ·  port ${tunnel.port}", false) { testLocalServer(tunnel) }
-            button("View backend output", false) { showBackendLog(tunnel) }
-            caption("Stop ends both the Node backend and the cloudflared connector for this tunnel.")
-        } else {
-            button("Extract project ZIP", false) {
-                if (tunnel.zipPath.isBlank() || !File(tunnel.zipPath).isFile) { note("The selected ZIP file is missing. Edit the tunnel and choose the ZIP again."); return@button }
-                extractAndReport(tunnel)
-            }
-            button("Test local server  ·  port ${tunnel.port}", false) { testLocalServer(tunnel) }
-            button("Start backend  ·  port ${tunnel.port}", true) {
-                val dir = store.projectDirOf(tunnel)
-                val entryFile = File(dir, tunnel.entry).canonicalFile
-                if (!entryFile.path.startsWith(dir.canonicalPath + File.separator) || !entryFile.isFile) { note("Extract the ZIP and check the Node entry file path first."); return@button }
-                startBackendService(tunnel)
-                note("Starting the backend on port ${tunnel.port}.")
-            }
-            button("Start Cloudflare Tunnel", true) {
-                val connectorToken = secrets.get("tunnel-token:${tunnel.id}")
-                if (connectorToken.isNullOrBlank()) { note("The connector token is missing. Delete this tunnel and create it again."); return@button }
-                startTunnelService(tunnel)
-                note("Starting the Cloudflare connector.")
-            }
-            button("View backend output", false) { showBackendLog(tunnel) }
-            caption("If the public URL reports 502, run Test local server. A refused connection means the backend is not listening; a valid page means the port or hostname config is the problem.")
-            caption("Keep the phone powered and online. Android battery controls may still stop services.")
+        if (runtime?.server?.let(::statusActive) != true) button(if (tunnel.frontend) "Extract frontend ZIP" else "Extract project ZIP", false) {
+            if (tunnel.zipPath.isBlank() || !File(tunnel.zipPath).isFile) { note("The selected ZIP file is missing. Edit the tunnel and choose the ZIP again."); return@button }
+            extractAndReport(tunnel)
         }
+        button(if (runtime?.server?.let(::statusActive) == true) "Server already active" else "Start ${if (tunnel.frontend) "frontend" else "backend"} server · port ${tunnel.port}", true) {
+            if (runtime?.server?.let(::statusActive) == true) { note("${if (tunnel.frontend) "Frontend" else "Backend"} status: ${runtime.server}."); return@button }
+            prepareTunnelPort(tunnel) {
+                if (tunnel.frontend) {
+                    val root = resolveFrontendRoot(store.projectDirOf(tunnel), tunnel.webRoot)
+                    if (root == null) { note("No index.html found. Extract this ZIP and set the site folder to dist, build, or the folder containing index.html."); return@prepareTunnelPort }
+                    startFrontendService(tunnel, root)
+                    note("Frontend starting on port ${tunnel.port}.")
+                } else {
+                    val dir = store.projectDirOf(tunnel)
+                    val entryFile = File(dir, tunnel.entry).canonicalFile
+                    if (!entryFile.path.startsWith(dir.canonicalPath + File.separator) || !entryFile.isFile) { note("Extract the ZIP and check the Node entry file path first."); return@prepareTunnelPort }
+                    startBackendService(tunnel)
+                    note("Backend starting on port ${tunnel.port}.")
+                }
+            }
+        }
+        button(if (runtime?.tunnel?.let(::statusActive) == true) "Tunnel already active" else "Start Cloudflare Tunnel", true) {
+            if (runtime?.tunnel?.let(::statusActive) == true) { note("Cloudflare tunnel status: ${runtime.tunnel}."); return@button }
+            val connectorToken = secrets.get("tunnel-token:${tunnel.id}")
+            if (connectorToken.isNullOrBlank()) { note("The connector token is missing. Delete this tunnel and create it again."); return@button }
+            startTunnelService(tunnel)
+            note("Starting the local server first; Cloudflare will connect when port ${tunnel.port} responds.")
+        }
+        if (runtime?.tunnel?.let(::statusActive) == true) {
+            button("Restart Cloudflare Tunnel", false) {
+                if (secrets.get("tunnel-token:${tunnel.id}").isNullOrBlank()) { note("The connector token is missing. Delete this tunnel and create it again."); return@button }
+                startTunnelService(tunnel, restart = true)
+                note("Restarting the local origin and Cloudflare connection.")
+            }
+        }
+        if (isRunning) button("Stop server and tunnel", false) { stopTunnel(tunnel); note("Stopping ${tunnel.name} services.") }
+        button("Test local server  ·  port ${tunnel.port}", false) { testLocalServer(tunnel) }
+        button("View ${if (tunnel.frontend) "frontend" else "backend"} and tunnel output", false) { showBackendLog(tunnel) }
+        caption("If the site ZIP contains dist/index.html, create a frontend site or reselect that ZIP while editing; backend projects return their own API routes at `/`.")
+        caption("Keep the phone powered and online. Android battery controls may still stop services.")
         button("Edit tunnel", false) { openWizard(tunnel) }
         button("Delete tunnel", false) { deleteDialog(tunnel) }
     }
@@ -746,7 +1200,7 @@ class MainActivity : Activity() {
         text(body, "Set up the connection for this project, then browse its tables and data here.", 13, muted, false, 0, 12)
         button("Configure database connection", true) { showDatabaseConfig(tunnel) }
         button("Paste SQL · create or change tables", false) { showSqlEditor(tunnel) }
-        caption("SQLite is stored on this phone. MySQL, PostgreSQL and MongoDB settings connect to a server you already run; this app does not yet install those server engines on Android.")
+        caption("Pocket Tunnel includes an on-device MariaDB server for MySQL projects. Set up a database from the home Database section, then use its .env connection here. Other MySQL, PostgreSQL and MongoDB connections need a server reachable from this phone.")
         card("Connection")
         if (databaseProvider.isNotBlank()) row("Database type", databaseProvider)
         if (databaseName.isNotBlank()) row("Database", databaseName)
@@ -790,7 +1244,7 @@ class MainActivity : Activity() {
                 }
             }
         }
-        caption("MySQL/MariaDB, PostgreSQL and MongoDB use the matching driver in the ZIP's node_modules. SQLite files are opened directly by Android. Queries are read-only and limited to 100 rows per table.")
+        caption("Run SQL scripts against the connection in this project's .env. MySQL/MariaDB scripts may contain multiple statements and USE directives. Table browsing shows up to 100 rows per table.")
     }
 
     private fun showSqlEditor(tunnel: TunnelProfile) {
@@ -839,6 +1293,8 @@ class MainActivity : Activity() {
         val user = EditText(this).apply { hint = "Username"; setText(current("DB_USER")); setSingleLine(true) }
         val password = EditText(this).apply { hint = "Password"; setText(current("DB_PASSWORD")); setSingleLine(true); inputType = 129 }
         listOf(name, host, port, user, password).forEach { panel.addView(it, match(3)) }
+        val showPassword = CheckBox(this).apply { text = "Show password"; setTextColor(ink); setOnCheckedChangeListener { _, checked -> password.inputType = if (checked) 1 else 129; password.setSelection(password.text.length) } }
+        panel.addView(showPassword, match(3))
         provider.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
             override fun onNothingSelected(parent: android.widget.AdapterView<*>?) = Unit
             override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: View?, position: Int, id: Long) {
@@ -859,7 +1315,11 @@ class MainActivity : Activity() {
                 val dbPassword = password.text.toString()
                 if (kind != "sqlite" && dbHost.isBlank()) { note("Enter the database server host. 127.0.0.1 means this Android phone."); return@setPositiveButton }
                 val values = linkedMapOf("DB_TYPE" to kind, "DB_NAME" to dbName, "DB_HOST" to dbHost, "DB_PORT" to dbPort, "DB_USER" to dbUser, "DB_PASSWORD" to dbPassword)
-                if (kind == "sqlite") values["DB_PATH"] = dbName
+                if (kind == "sqlite") {
+                    values["DB_PATH"] = dbName
+                    runCatching { val dbFile = File(root, dbName).canonicalFile; require(dbFile.path.startsWith(root.canonicalPath + File.separator)); dbFile.parentFile?.mkdirs(); android.database.sqlite.SQLiteDatabase.openOrCreateDatabase(dbFile, null).close() }
+                        .onFailure { note("Could not create SQLite database: ${it.message}"); return@setPositiveButton }
+                }
                 if (kind != "sqlite") {
                     val encodedUser = java.net.URLEncoder.encode(dbUser, "UTF-8").replace("+", "%20")
                     val encodedPassword = java.net.URLEncoder.encode(dbPassword, "UTF-8").replace("+", "%20")
@@ -924,8 +1384,8 @@ class MainActivity : Activity() {
         caption("Showing up to 100 rows. Values are clipped to 500 characters each.")
     }
 
-    private fun openWizard(existing: TunnelProfile?, startPage: Int = 0) {
-        draft = existing ?: newDraft()
+    private fun openWizard(existing: TunnelProfile?, startPage: Int = 0, frontend: Boolean = existing?.frontend ?: false) {
+        draft = existing ?: newDraft(frontend)
         editingComplete = existing?.complete == true
         draft!!.page = startPage
         store.save(draft!!)
@@ -933,15 +1393,17 @@ class MainActivity : Activity() {
         render()
     }
 
-    private fun newDraft(): TunnelProfile {
+    private fun newDraft(frontend: Boolean): TunnelProfile {
         return TunnelProfile(
             id = UUID.randomUUID().toString(),
-            name = store.uniqueSlug("phone-backend") { it.name },
-            projectName = store.uniqueSlug("my-backend") { it.projectName },
+            name = store.uniqueSlug(if (frontend) "phone-frontend" else "phone-backend") { it.name },
+            projectName = store.uniqueSlug(if (frontend) "my-frontend" else "my-backend") { it.projectName },
+            frontend = frontend,
+            webRoot = "dist",
             zipName = "",
             zipPath = "",
             entry = "server.js",
-            port = "3000",
+            port = (availableProjectPort(3000, "") ?: 3000).toString(),
             hostname = "",
             tunnelId = "",
             zoneName = "",
@@ -1053,18 +1515,40 @@ class MainActivity : Activity() {
             .putExtra(RuntimeService.PROJECT_DIR, store.projectDirOf(tunnel).absolutePath)
             .putExtra(RuntimeService.ENTRY, tunnel.entry).putExtra(RuntimeService.PORT, tunnel.port)
         startForegroundServiceCompat(intent)
-        RunStatus.put(tunnel.id, tunnel.name)
     }
 
-    private fun startTunnelService(tunnel: TunnelProfile) {
+    private fun startFrontendService(tunnel: TunnelProfile, root: File) {
+        val slot = RunSlots.slotFor(this, tunnel.id)
+        if (slot < 0) { note("All runtime slots are busy. Stop a running tunnel first."); return }
+        val intent = Intent(this, RunSlots.serviceClass(slot)).setAction(RuntimeService.START_FRONTEND)
+            .putExtra(RuntimeService.KEY, tunnel.id).putExtra(RuntimeService.NAME, tunnel.name)
+            .putExtra(RuntimeService.WEB_ROOT, root.absolutePath).putExtra(RuntimeService.PORT, tunnel.port)
+        startForegroundServiceCompat(intent)
+    }
+
+    private fun startTunnelService(tunnel: TunnelProfile, restart: Boolean = false) {
         val slot = RunSlots.slotFor(this, tunnel.id)
         if (slot < 0) { note("All runtime slots are busy. Stop a running tunnel first."); return }
         val connectorToken = secrets.get("tunnel-token:${tunnel.id}") ?: return
-        val intent = Intent(this, RunSlots.serviceClass(slot)).setAction(RuntimeService.START_TUNNEL)
+        val intent = Intent(this, RunSlots.serviceClass(slot)).setAction(if (restart) RuntimeService.RESTART_TUNNEL else RuntimeService.START_TUNNEL)
             .putExtra(RuntimeService.KEY, tunnel.id).putExtra(RuntimeService.NAME, tunnel.name)
+            .putExtra(RuntimeService.PORT, tunnel.port)
             .putExtra(RuntimeService.TUNNEL_TOKEN, connectorToken)
+            .putExtra(RuntimeService.SERVICE_LABEL, if (tunnel.frontend) "frontend" else "backend")
+        if (tunnel.frontend) {
+            val root = resolveFrontendRoot(store.projectDirOf(tunnel), tunnel.webRoot)
+            if (root == null) { note("No index.html found. Extract the ZIP and set the site folder before starting its tunnel."); return }
+            intent.putExtra(RuntimeService.WEB_ROOT, root.absolutePath)
+        } else {
+            val dir = store.projectDirOf(tunnel)
+            val entry = File(dir, tunnel.entry).canonicalFile
+            if (!entry.path.startsWith(dir.canonicalPath + File.separator) || !entry.isFile) {
+                note("Extract the backend ZIP and check its Node entry file before starting the tunnel.")
+                return
+            }
+            intent.putExtra(RuntimeService.PROJECT_DIR, dir.absolutePath).putExtra(RuntimeService.ENTRY, tunnel.entry)
+        }
         startForegroundServiceCompat(intent)
-        RunStatus.put(tunnel.id, tunnel.name)
     }
 
     private fun startForegroundServiceCompat(intent: Intent) {
@@ -1104,18 +1588,50 @@ class MainActivity : Activity() {
             if (!displayName.endsWith(".zip", true)) error("Choose a ZIP file.")
             val target = File(File(filesDir, "uploads"), "${(draft?.id ?: UUID.randomUUID().toString()).take(8)}-$displayName").apply { parentFile?.mkdirs() }
             contentResolver.openInputStream(source).use { input -> FileOutputStream(target).use { output -> input?.copyTo(output) ?: error("Could not read the selected ZIP.") } }
-            draft?.zipPath = target.absolutePath
-            draft?.zipName = displayName
-            draft?.let { store.save(it) }
+            var detectedFrontend = false
+            draft?.let { profile ->
+                profile.zipPath = target.absolutePath
+                profile.zipName = displayName
+                if (!profile.frontend) {
+                    val siteFolder = detectStaticFrontendZip(target)
+                    if (siteFolder != null) {
+                        profile.frontend = true
+                        profile.webRoot = siteFolder
+                        detectedFrontend = true
+                    }
+                }
+                store.save(profile)
+            }
             render()
+            if (detectedFrontend) note("This ZIP contains a built frontend site. Pocket Tunnel switched it to frontend hosting.")
         } catch (e: Exception) { note(e.message ?: "Could not read that file location.") }
     }
 
+    private fun detectStaticFrontendZip(zipFile: File): String? = inspectFrontendZip(zipFile)
+        ?.takeIf { !it.second }?.first
+
+    private fun inspectFrontendZip(zipFile: File): Pair<String, Boolean>? = runCatching {
+        ZipFile(zipFile).use { zip ->
+            val names = zip.entries().asSequence().map { it.name.replace('\\', '/').removePrefix("./").trimStart('/') }.toList()
+            val indexPath = names.firstOrNull { it.endsWith("index.html", ignoreCase = true) } ?: return@use null
+            val hasServerEntry = names.any { path ->
+                val clean = path.lowercase(Locale.US)
+                (clean == "server.js" || clean.endsWith("/server.js") || clean == "app.js" || clean.endsWith("/src/index.js") || clean.endsWith("/server/src/index.js")) &&
+                    !clean.contains("/dist/") && !clean.contains("/build/") && !clean.contains("/assets/")
+            }
+            val parent = indexPath.substringBeforeLast('/', "")
+            (if (parent.isBlank()) "." else parent.substringAfterLast('/')) to hasServerEntry
+        }
+    }.getOrNull()
+
     private fun cloudflareAction(message: String, work: () -> Unit, onDone: (Throwable?) -> Unit = {}) {
-        note(message)
+        showStatusOverlay(message, true)
         Thread {
             val failure = try { work(); null } catch (e: Throwable) { e }
-            runOnUiThread { if (failure != null) note(failure.message ?: "Cloudflare request failed."); onDone(failure) }
+            runOnUiThread {
+                if (failure != null) note(failure.message ?: "Cloudflare request failed.") else showStatusOverlay("Done", false)
+                onDone(failure)
+            }
         }.start()
     }
 
@@ -1123,6 +1639,17 @@ class MainActivity : Activity() {
         try {
             val dir = store.projectDirOf(tunnel)
             extractProject(File(tunnel.zipPath), dir)
+            if (tunnel.frontend) {
+                val siteRoot = resolveFrontendRoot(dir, tunnel.webRoot)
+                if (siteRoot != null) {
+                    tunnel.webRoot = siteRoot.relativeTo(dir.canonicalFile).path.ifBlank { "." }
+                    store.save(tunnel)
+                    note("Frontend extracted. Found index.html in ${tunnel.webRoot}.")
+                } else {
+                    note("ZIP extracted, but no index.html was found. Choose the built site output (usually dist) and ZIP its contents.")
+                }
+                return
+            }
             val entryFile = File(dir, tunnel.entry)
             if (entryFile.isFile) {
                 note("Project extracted into app storage.")
@@ -1138,6 +1665,26 @@ class MainActivity : Activity() {
         } catch (e: Exception) {
             note(e.message ?: "Could not extract ZIP.")
         }
+    }
+
+    private fun resolveFrontendRoot(projectDir: File, preferred: String): File? {
+        val base = runCatching { projectDir.canonicalFile }.getOrNull()?.takeIf { it.isDirectory } ?: return null
+        if (preferred.isBlank() || preferred.startsWith("/") || preferred.split('/').any { it == ".." }) return null
+        val direct = runCatching { File(base, preferred).canonicalFile }.getOrNull()
+        if (direct != null && direct.path.startsWith(base.path + File.separator) && File(direct, "index.html").isFile) return direct
+        if (preferred == "." && File(base, "index.html").isFile) return base
+        val folderName = preferred.trimEnd('/').substringAfterLast('/').takeIf { it.isNotBlank() }
+        val candidates = base.walkTopDown()
+            .onEnter { file -> file == base || !file.name.equals("node_modules", true) }
+            .filter { it.isDirectory && it.name == folderName && File(it, "index.html").isFile }
+            .take(2).toList()
+        if (candidates.size == 1) return candidates.single().canonicalFile
+        if (File(base, "index.html").isFile) return base
+        val common = base.walkTopDown()
+            .onEnter { file -> file == base || !file.name.equals("node_modules", true) }
+            .filter { it.isDirectory && it.name in setOf("dist", "build", "public") && File(it, "index.html").isFile }
+            .take(2).toList()
+        return common.singleOrNull()?.canonicalFile
     }
 
     private fun testLocalServer(tunnel: TunnelProfile) {
@@ -1161,9 +1708,10 @@ class MainActivity : Activity() {
                 val message = buildString {
                     append("Nothing answered on port ${tunnel.port}.\n\n")
                     append("Connection error: ${error.message ?: "connection failed"}\n\n")
-                    append("Start the backend and make sure it listens on port ${tunnel.port}.")
-                    if (log.isNotBlank()) append("\n\nRecent backend output:\n$log")
-                    else append("\n\nNo backend output log exists yet. Start backend once, then check View backend output.")
+                    val serverName = if (tunnel.frontend) "frontend site server" else "backend"
+                    append("Start the $serverName and make sure it listens on port ${tunnel.port}.")
+                    if (log.isNotBlank()) append("\n\nRecent $serverName output:\n$log")
+                    else append("\n\nNo $serverName output log exists yet. Start it once, then check View output.")
                     if (tunnelLog.isNotBlank()) append("\n\nRecent Cloudflare output:\n$tunnelLog")
                 }
                 null to message
@@ -1202,7 +1750,7 @@ class MainActivity : Activity() {
             setText(logText); textSize = 11f; typeface = android.graphics.Typeface.MONOSPACE; setTextColor(ink); setPadding(dp(13), dp(13), dp(13), dp(13))
         }
         val scroll = ScrollView(this).apply { addView(view) }
-        AlertDialog.Builder(this).setTitle("Backend output · ${tunnel.name}").setView(scroll).setPositiveButton("Close", null).show()
+        AlertDialog.Builder(this).setTitle("${if (tunnel.frontend) "Frontend" else "Backend"} output · ${tunnel.name}").setView(scroll).setPositiveButton("Close", null).show()
     }
 
     private fun extractProject(zip: File, root: File) {
@@ -1289,5 +1837,38 @@ class MainActivity : Activity() {
     }
     private fun caption(value: String) { text(body, value, 11, muted, false, 15, 5) }
     private fun gap(parent: LinearLayout, h: Int) { parent.addView(View(this), LinearLayout.LayoutParams(1, dp(h))) }
-    private fun note(message: String) { Toast.makeText(this, message, Toast.LENGTH_LONG).show() }
+    private fun note(message: String) = showStatusOverlay(message, false)
+
+    private fun showStatusOverlay(message: String, busy: Boolean) {
+        statusMessage = message
+        statusBusy = busy
+        val frame = screenRoot ?: return
+        statusView?.let(frame::removeView)
+        val banner = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(16), dp(12), dp(16), dp(12))
+            background = android.graphics.drawable.GradientDrawable().apply {
+                setColor(if (busy) ink else if (message.contains("failed", true) || message.contains("could not", true) || message.contains("error", true)) Color.rgb(126, 60, 42) else green)
+                cornerRadius = dp(16).toFloat()
+            }
+            elevation = dp(8).toFloat()
+        }
+        if (busy) banner.addView(ProgressBar(this).apply { isIndeterminate = true }, LinearLayout.LayoutParams(dp(22), dp(22)))
+        banner.addView(TextView(this).apply {
+            text = message; textSize = 13f; setTextColor(Color.WHITE); maxLines = 3
+            setPadding(if (busy) dp(11) else 0, 0, 0, 0)
+        }, LinearLayout.LayoutParams(0, -2, 1f))
+        val lp = android.widget.FrameLayout.LayoutParams(-1, -2, Gravity.TOP).apply {
+            setMargins(dp(18), dp(10), dp(18), 0)
+        }
+        frame.addView(banner, lp)
+        statusView = banner
+        if (!busy) banner.postDelayed({
+            if (statusView === banner) {
+                frame.removeView(banner)
+                statusView = null
+                statusMessage = ""
+            }
+        }, 3500)
+    }
 }

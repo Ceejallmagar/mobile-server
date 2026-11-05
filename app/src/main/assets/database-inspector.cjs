@@ -92,7 +92,10 @@ async function run() {
     const { connectionString, common } = connectionOptions(env, provider);
     database = common.database || '';
     host = common.host || '';
-    const connection = await mysql.createConnection({ ...common, connectTimeout: 8000, multipleStatements: false });
+    // Schema dumps commonly contain several statements and a `USE database;`
+    // directive. The SQL editor is an explicit user action and the app user is
+    // scoped to its configured database, so allow the complete script here.
+    const connection = await mysql.createConnection({ ...common, connectTimeout: 8000, multipleStatements: true });
     try {
       if (action === 'query') {
         if (!requestedQuery.trim()) throw new Error('Paste a SQL statement first.');

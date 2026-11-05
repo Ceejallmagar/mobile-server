@@ -11,6 +11,8 @@ data class TunnelProfile(
     val id: String,
     var name: String,
     var projectName: String,
+    var frontend: Boolean,
+    var webRoot: String,
     var zipName: String,
     var zipPath: String,
     var entry: String,
@@ -76,6 +78,8 @@ class TunnelStore(private val context: Context) {
                 .put("id", tunnel.id)
                 .put("name", tunnel.name)
                 .put("project_name", tunnel.projectName)
+                .put("frontend", tunnel.frontend)
+                .put("web_root", tunnel.webRoot)
                 .put("zip_name", tunnel.zipName)
                 .put("zip_path", tunnel.zipPath)
                 .put("entry", tunnel.entry)
@@ -104,6 +108,8 @@ class TunnelStore(private val context: Context) {
                     id = item.optString("id"),
                     name = item.optString("name"),
                     projectName = item.optString("project_name"),
+                    frontend = item.optBoolean("frontend", false),
+                    webRoot = item.optString("web_root", "dist"),
                     zipName = item.optString("zip_name"),
                     zipPath = item.optString("zip_path"),
                     entry = item.optString("entry", "server.js"),
@@ -131,6 +137,8 @@ class TunnelStore(private val context: Context) {
             id = legacyTunnelId,
             name = setup.getString("tunnel", "phone-backend") ?: "phone-backend",
             projectName = appName,
+            frontend = false,
+            webRoot = "dist",
             zipName = File(zip).takeIf { it.isFile }?.name ?: "",
             zipPath = zip,
             entry = setup.getString("entry", "server.js") ?: "server.js",

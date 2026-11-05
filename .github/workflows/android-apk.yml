@@ -19,7 +19,7 @@ jobs:
           java-version: '17'
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.27.2'
+          go-version: '1.27.3'
       - uses: android-actions/setup-android@v3
         with:
           packages: platform-tools
@@ -29,8 +29,9 @@ jobs:
         run: |
           git clone --depth 1 --branch 2026.10.0 https://github.com/cloudflare/cloudflared.git /tmp/cloudflared
           mkdir -p app/src/main/assets/runtime/arm64-v8a
+          NDK_BIN="$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin"
           cd /tmp/cloudflared
-          GOOS=android GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o "$GITHUB_WORKSPACE/app/src/main/assets/runtime/arm64-v8a/cloudflared" ./cmd/cloudflared
+          GOOS=android GOARCH=arm64 CGO_ENABLED=1 CC="$NDK_BIN/aarch64-linux-android29-clang" go build -tags=netcgo -trimpath -ldflags='-s -w' -o "$GITHUB_WORKSPACE/app/src/main/assets/runtime/arm64-v8a/cloudflared" ./cmd/cloudflared
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'

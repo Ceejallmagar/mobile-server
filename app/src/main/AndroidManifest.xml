@@ -12,5 +12,6 @@
         <service android:name=".RuntimeSlot2" android:exported="false" android:process=":runtime2" />
         <service android:name=".RuntimeSlot3" android:exported="false" android:process=":runtime3" />
         <service android:name=".DatabaseInspectorService" android:exported="false" android:process=":database" />
+        <service android:name=".MariaDbService" android:exported="false" android:process=":mariadb" />
     </application>
 </manifest>
