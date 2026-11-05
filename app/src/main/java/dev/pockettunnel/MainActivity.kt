@@ -736,23 +736,23 @@ class MainActivity : Activity() {
         val tunnel = store.get(detailId) ?: run { screen = "home"; render(); return }
         text(body, "DATABASE MANAGER", 11, green, true, 0, 8)
         text(body, "${tunnel.projectName} database", 26, ink, true, 0, 6)
-        text(body, "Read-only access to the database configured for this extracted backend. Password values stay hidden and are read from its .env file.", 13, muted, false, 0, 12)
+        text(body, "Set up the connection for this project, then browse its tables and data here.", 13, muted, false, 0, 12)
         button("Configure database connection", true) { showDatabaseConfig(tunnel) }
         caption("SQLite is stored on this phone. MySQL, PostgreSQL and MongoDB settings connect to a server you already run; this app does not yet install those server engines on Android.")
         card("Connection")
         if (databaseProvider.isNotBlank()) row("Database type", databaseProvider)
         if (databaseName.isNotBlank()) row("Database", databaseName)
         if (databaseHost.isNotBlank()) row("Host", databaseHost)
-        button(if (databaseLoading) "Connecting…" else "Refresh tables", true) {
+        button(if (databaseLoading) "Connecting to database…" else "Refresh tables", true) {
             if (!databaseLoading) requestDatabaseInspection("tables")
         }
+        if (databaseLoading) loadingRow(if (databaseAction == "rows") "Loading up to 100 rows" else "Connecting and loading tables")
+        if (databaseProvider.isNotBlank() && databaseError.isBlank() && !databaseLoading) statusPill("Connected · $databaseProvider", running)
         if (databaseError.isNotBlank()) {
             card("Could not open database")
             text(body, databaseError, 12, alert, false, 0, 8)
         }
-        if (databaseLoading) {
-            caption(if (databaseAction == "rows") "Loading the first 100 rows…" else "Connecting and listing tables…")
-        } else if (databaseAction == "tables" && databaseError.isBlank()) {
+        if (!databaseLoading && databaseAction == "tables" && databaseError.isBlank()) {
             card("Tables and collections")
             if (databaseTables.length() == 0) {
                 text(body, "No tables were returned. Check the database name and the account's read permissions.", 12, muted, false, 0, 8)
@@ -846,7 +846,8 @@ class MainActivity : Activity() {
         val scope = listOf(databaseSchema, databaseName).filter { it.isNotBlank() }.joinToString(" · ")
         if (scope.isNotBlank()) text(body, scope, 12, muted, false, 0, 10)
         if (databaseLoading) {
-            card("Loading rows…")
+            text(body, databaseTable, 26, ink, true, 0, 6)
+            loadingRow("Loading up to 100 rows from $databaseTable")
             return
         }
         if (databaseError.isNotBlank()) {
@@ -1201,8 +1202,36 @@ class MainActivity : Activity() {
         return EditText(this).apply { setSingleLine(true); textSize = 14f; setTextColor(ink); setHintTextColor(muted); hint = label; setText(value); setPadding(dp(13), dp(12), dp(13), dp(12)); setBackgroundColor(Color.WHITE); body.addView(this, match(4)) }
     }
     private fun button(label: String, primary: Boolean, action: () -> Unit) {
-        val view = TextView(this).apply { text = label; textSize = 14f; setTypeface(null, 1); gravity = Gravity.CENTER; setTextColor(if (primary) Color.WHITE else green); setBackgroundColor(if (primary) green else Color.WHITE); setPadding(dp(15), dp(15), dp(15), dp(15)); setOnClickListener { action() } }
+        val view = TextView(this).apply {
+            text = label; textSize = 14f; setTypeface(null, 1); gravity = Gravity.CENTER
+            setTextColor(if (primary) Color.WHITE else green)
+            background = android.graphics.drawable.GradientDrawable().apply {
+                setColor(if (primary) green else Color.WHITE)
+                cornerRadius = dp(14).toFloat()
+                if (!primary) setStroke(dp(1), Color.rgb(223, 231, 224))
+            }
+            setPadding(dp(15), dp(14), dp(15), dp(14)); isClickable = true; isFocusable = true
+            setOnClickListener { action() }
+        }
         val lp = match(9); lp.topMargin = dp(9); body.addView(view, lp)
+    }
+    private fun loadingRow(label: String) {
+        val line = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            background = android.graphics.drawable.GradientDrawable().apply { setColor(Color.WHITE); cornerRadius = dp(14).toFloat() }
+        }
+        line.addView(ProgressBar(this).apply { isIndeterminate = true }, LinearLayout.LayoutParams(dp(24), dp(24)))
+        line.addView(TextView(this).apply { text = label; textSize = 13f; setTextColor(ink); setPadding(dp(11), 0, 0, 0) }, LinearLayout.LayoutParams(0, -2, 1f))
+        body.addView(line, match(10))
+    }
+    private fun statusPill(label: String, color: Int) {
+        val pill = TextView(this).apply {
+            text = "●  $label"; textSize = 12f; setTextColor(color); setTypeface(null, 1)
+            setPadding(dp(12), dp(9), dp(12), dp(9))
+            background = android.graphics.drawable.GradientDrawable().apply { setColor(accentSoft); cornerRadius = dp(18).toFloat() }
+        }
+        body.addView(pill, match(6))
     }
     private fun row(label: String, value: String) {
         val line = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(14), dp(10), dp(14), dp(10)); setBackgroundColor(Color.WHITE) }
