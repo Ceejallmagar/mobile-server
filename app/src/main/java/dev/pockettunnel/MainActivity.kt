@@ -40,6 +40,7 @@ class MainActivity : Activity() {
     private var databaseName = ""
     private var databaseHost = ""
     private var databaseError = ""
+    private var databaseNotice = ""
     private var databaseTables = JSONArray()
     private var databaseColumns = JSONArray()
     private var databaseRows = JSONArray()
@@ -80,12 +81,17 @@ class MainActivity : Activity() {
                 databaseError = result?.optString("error")?.takeIf { it.isNotBlank() } ?: "Database inspection failed."
             } else {
                 databaseError = ""
+                val queryCompleted = databaseAction == "query"
+                if (queryCompleted) {
+                    databaseNotice = result.optString("message", "SQL executed successfully.")
+                } else databaseNotice = ""
                 databaseProvider = result.optString("provider", databaseProvider)
                 databaseName = result.optString("database", databaseName)
                 databaseHost = result.optString("host", databaseHost)
-                if (databaseAction == "tables") databaseTables = result.optJSONArray("tables") ?: JSONArray()
+                if (!queryCompleted && databaseAction == "tables") databaseTables = result.optJSONArray("tables") ?: JSONArray()
                 databaseColumns = result.optJSONArray("columns") ?: JSONArray()
                 databaseRows = result.optJSONArray("rows") ?: JSONArray()
+                if (queryCompleted) { requestDatabaseInspection("tables"); return }
             }
             render()
         }
@@ -691,7 +697,7 @@ class MainActivity : Activity() {
         requestDatabaseInspection("tables")
     }
 
-    private fun requestDatabaseInspection(action: String, schema: String = "", table: String = "") {
+    private fun requestDatabaseInspection(action: String, schema: String = "", table: String = "", query: String = "") {
         val tunnel = store.get(detailId) ?: return
         val projectRoot = databaseWorkingDirectory(tunnel)
         if (!projectRoot.isDirectory) {
@@ -720,6 +726,7 @@ class MainActivity : Activity() {
             putExtra(DatabaseInspectorService.EXTRA_ACTION, action)
             putExtra(DatabaseInspectorService.EXTRA_SCHEMA, schema)
             putExtra(DatabaseInspectorService.EXTRA_TABLE, table)
+            putExtra(DatabaseInspectorService.EXTRA_QUERY, query)
         })
     }
 
@@ -738,6 +745,7 @@ class MainActivity : Activity() {
         text(body, "${tunnel.projectName} database", 26, ink, true, 0, 6)
         text(body, "Set up the connection for this project, then browse its tables and data here.", 13, muted, false, 0, 12)
         button("Configure database connection", true) { showDatabaseConfig(tunnel) }
+        button("Paste SQL · create or change tables", false) { showSqlEditor(tunnel) }
         caption("SQLite is stored on this phone. MySQL, PostgreSQL and MongoDB settings connect to a server you already run; this app does not yet install those server engines on Android.")
         card("Connection")
         if (databaseProvider.isNotBlank()) row("Database type", databaseProvider)
@@ -752,6 +760,7 @@ class MainActivity : Activity() {
             card("Could not open database")
             text(body, databaseError, 12, alert, false, 0, 8)
         }
+        if (databaseNotice.isNotBlank()) statusPill(databaseNotice, running)
         if (!databaseLoading && databaseAction == "tables" && databaseError.isBlank()) {
             card("Tables and collections")
             if (databaseTables.length() == 0) {
@@ -782,6 +791,34 @@ class MainActivity : Activity() {
             }
         }
         caption("MySQL/MariaDB, PostgreSQL and MongoDB use the matching driver in the ZIP's node_modules. SQLite files are opened directly by Android. Queries are read-only and limited to 100 rows per table.")
+    }
+
+    private fun showSqlEditor(tunnel: TunnelProfile) {
+        val editor = EditText(this).apply {
+            hint = "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(100));"
+            textSize = 13f
+            typeface = android.graphics.Typeface.MONOSPACE
+            gravity = Gravity.TOP or Gravity.START
+            minLines = 9
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+        }
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(18), dp(4), dp(18), dp(4))
+            addView(TextView(this@MainActivity).apply {
+                text = "Runs against the database connection saved in this project's .env. Use the database's own port from that config. SQL changes are applied immediately."
+                textSize = 12f; setTextColor(muted); setPadding(0, 0, 0, dp(10))
+            })
+            addView(editor, LinearLayout.LayoutParams(-1, dp(200)))
+        }
+        AlertDialog.Builder(this).setTitle("Run SQL · ${databaseProvider.ifBlank { "configured database" }}")
+            .setView(content).setNegativeButton("Cancel", null)
+            .setPositiveButton("Execute SQL") { _, _ ->
+                val sql = editor.text.toString().trim()
+                if (sql.isBlank()) { note("Paste a SQL statement first."); return@setPositiveButton }
+                databaseNotice = ""
+                requestDatabaseInspection("query", query = sql)
+            }.show()
     }
 
     private fun showDatabaseConfig(tunnel: TunnelProfile) {

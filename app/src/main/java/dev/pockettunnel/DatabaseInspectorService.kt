@@ -21,6 +21,7 @@ class DatabaseInspectorService : Service() {
         val action = intent.getStringExtra(EXTRA_ACTION).orEmpty()
         val schema = intent.getStringExtra(EXTRA_SCHEMA).orEmpty()
         val table = intent.getStringExtra(EXTRA_TABLE).orEmpty()
+        val query = intent.getStringExtra(EXTRA_QUERY).orEmpty()
 
         Thread {
             val result = runCatching {
@@ -29,9 +30,9 @@ class DatabaseInspectorService : Service() {
                 val env = readEnv(File(projectRoot, ".env"))
                 val source = databaseSource(env)
                 if (source.provider == "SQLite") {
-                    inspectSqlite(projectRoot, source.path, action, table)
+                    if (action == "query") executeSqlite(projectRoot, source.path, query) else inspectSqlite(projectRoot, source.path, action, table)
                 } else {
-                    inspectNodeDatabase(projectRoot, source.provider, action, schema, table, requestId)
+                    inspectNodeDatabase(projectRoot, source.provider, action, schema, table, query, requestId)
                 }
             }.getOrElse { JSONObject().put("ok", false).put("error", safeMessage(it)) }.toString()
 
@@ -43,6 +44,17 @@ class DatabaseInspectorService : Service() {
             }, 250)
         }.start()
         return START_NOT_STICKY
+    }
+
+    private fun executeSqlite(root: File, configuredPath: String, query: String): String {
+        require(query.isNotBlank()) { "Paste a SQL statement first." }
+        val path = File(configuredPath).let { if (it.isAbsolute) it else File(root, configuredPath) }
+        path.parentFile?.mkdirs()
+        val db = SQLiteDatabase.openDatabase(path.canonicalPath, null, SQLiteDatabase.OPEN_READWRITE or SQLiteDatabase.CREATE_IF_NECESSARY)
+        return try {
+            db.execSQL(query)
+            JSONObject().put("ok", true).put("provider", "SQLite").put("message", "SQL executed successfully.").toString()
+        } finally { db.close() }
     }
 
     private data class DatabaseSource(val provider: String, val path: String = "")
@@ -124,14 +136,14 @@ class DatabaseInspectorService : Service() {
         }
     }
 
-    private fun inspectNodeDatabase(root: File, provider: String, action: String, schema: String, table: String, requestId: String): String {
-        require(action == "tables" || action == "rows") { "Unsupported database action." }
+    private fun inspectNodeDatabase(root: File, provider: String, action: String, schema: String, table: String, query: String, requestId: String): String {
+        require(action == "tables" || action == "rows" || action == "query") { "Unsupported database action." }
         val script = File(cacheDir, "database-inspector.cjs")
         assets.open("database-inspector.cjs").bufferedReader().use { script.writeText(it.readText()) }
         val resultFile = File(cacheDir, "database-result-${requestId.ifBlank { UUID.randomUUID().toString() }}.json")
         resultFile.delete()
         val code = NodeEngine.startNode(
-            arrayOf("node", script.absolutePath, root.absolutePath, resultFile.absolutePath, action, provider, schema, table),
+            arrayOf("node", script.absolutePath, root.absolutePath, resultFile.absolutePath, action, provider, schema, table, query),
             root.absolutePath,
             "0",
             filesDir.absolutePath,
@@ -154,6 +166,7 @@ class DatabaseInspectorService : Service() {
         const val EXTRA_ACTION = "database_action"
         const val EXTRA_SCHEMA = "database_schema"
         const val EXTRA_TABLE = "database_table"
+        const val EXTRA_QUERY = "database_query"
         const val EXTRA_RESULT = "database_result"
     }
 }

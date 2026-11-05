@@ -8,6 +8,7 @@ const action = process.argv[4];
 const requestedProvider = process.argv[5];
 const requestedSchema = process.argv[6] || '';
 const requestedTable = process.argv[7] || '';
+const requestedQuery = process.argv[8] || '';
 
 function readEnv() {
   const values = {};
@@ -66,8 +67,12 @@ async function run() {
     const client = new Client(connectionString ? { connectionString, connectionTimeoutMillis: 8000, query_timeout: 15000 } : { ...common, connectionTimeoutMillis: 8000, query_timeout: 15000 });
     await client.connect();
     try {
-      await client.query('BEGIN READ ONLY');
-      if (action === 'tables') {
+      if (action === 'query') {
+        if (!requestedQuery.trim()) throw new Error('Paste a SQL statement first.');
+        await client.query(requestedQuery);
+        return { ok: true, provider, message: 'SQL executed successfully.' };
+      } else if (action === 'tables') {
+        await client.query('BEGIN READ ONLY');
         const result = await client.query("SELECT table_schema, table_name FROM information_schema.tables WHERE table_type='BASE TABLE' AND table_schema NOT IN ('pg_catalog','information_schema') ORDER BY table_schema, table_name");
         tables = result.rows.map(row => ({ name: row.table_name, schema: row.table_schema, kind: 'table' }));
         database = database || (await client.query('SELECT current_database() AS name')).rows[0].name;
@@ -77,7 +82,7 @@ async function run() {
         rows = result.rows.map(row => columns.map(name => row[name] == null ? null : (typeof row[name] === 'object' ? JSON.stringify(row[name]).slice(0, 500) : String(row[name]).slice(0, 500))));
       }
     } finally {
-      await client.query('ROLLBACK').catch(() => {});
+      if (action !== 'query') await client.query('ROLLBACK').catch(() => {});
       await client.end();
     }
   } else if (provider === 'MySQL') {
@@ -89,7 +94,11 @@ async function run() {
     host = common.host || '';
     const connection = await mysql.createConnection({ ...common, connectTimeout: 8000, multipleStatements: false });
     try {
-      if (action === 'tables') {
+      if (action === 'query') {
+        if (!requestedQuery.trim()) throw new Error('Paste a SQL statement first.');
+        await connection.query(requestedQuery);
+        return { ok: true, provider, message: 'SQL executed successfully.' };
+      } else if (action === 'tables') {
         const [result] = await connection.query('SHOW FULL TABLES');
         tables = result.map(row => {
           const key = Object.keys(row)[0];
@@ -108,6 +117,7 @@ async function run() {
       await connection.end();
     }
   } else if (provider === 'MongoDB') {
+    if (action === 'query') throw new Error('MongoDB does not use SQL. Use the MongoDB shell or add collection setup support.');
     const { MongoClient } = projectRequire('mongodb');
     const uri = env.MONGODB_URI || env.MONGO_URI || env.DATABASE_URL || env.DB_URL;
     if (!uri) throw new Error('Set MONGODB_URI or MONGO_URI in the project .env.');
