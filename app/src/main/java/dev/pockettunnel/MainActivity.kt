@@ -797,7 +797,7 @@ class MainActivity : Activity() {
         provider.setSelection(when { type.contains("mysql") || type.contains("maria") -> 1; type.contains("postgres") || type == "pg" -> 2; type.contains("mongo") -> 3; else -> 0 })
         panel.addView(provider, match(4))
         val name = EditText(this).apply { hint = "Database name (or SQLite path)"; setText(current("DB_NAME", if (provider.selectedItemPosition == 0) "pocket.db" else "appdb")); setSingleLine(true) }
-        val host = EditText(this).apply { hint = "Host (remote DB only)"; setText(current("DB_HOST", "127.0.0.1")); setSingleLine(true) }
+        val host = EditText(this).apply { hint = "Database server host (e.g. 192.168.1.20)"; setText(current("DB_HOST")); setSingleLine(true) }
         val port = EditText(this).apply { hint = "Port"; setText(current("DB_PORT", "3306")); setSingleLine(true); inputType = 2 }
         val user = EditText(this).apply { hint = "Username"; setText(current("DB_USER")); setSingleLine(true) }
         val password = EditText(this).apply { hint = "Password"; setText(current("DB_PASSWORD")); setSingleLine(true); inputType = 129 }
@@ -816,14 +816,23 @@ class MainActivity : Activity() {
             .setPositiveButton("Save settings") { _, _ ->
                 val kind = when (provider.selectedItemPosition) { 1 -> "mysql"; 2 -> "postgres"; 3 -> "mongodb"; else -> "sqlite" }
                 val dbName = name.text.toString().trim()
-                val values = linkedMapOf("DB_TYPE" to kind, "DB_NAME" to dbName, "DB_HOST" to host.text.toString().trim(), "DB_PORT" to port.text.toString().trim(), "DB_USER" to user.text.toString().trim(), "DB_PASSWORD" to password.text.toString())
+                val dbHost = host.text.toString().trim()
+                val dbPort = port.text.toString().trim()
+                val dbUser = user.text.toString().trim()
+                val dbPassword = password.text.toString()
+                if (kind != "sqlite" && dbHost.isBlank()) { note("Enter the database server host. 127.0.0.1 means this Android phone."); return@setPositiveButton }
+                val values = linkedMapOf("DB_TYPE" to kind, "DB_NAME" to dbName, "DB_HOST" to dbHost, "DB_PORT" to dbPort, "DB_USER" to dbUser, "DB_PASSWORD" to dbPassword)
                 if (kind == "sqlite") values["DB_PATH"] = dbName
-                if (kind == "mongodb") {
-                    val credentials = if (user.text.isNullOrBlank()) "" else "${java.net.URLEncoder.encode(user.text.toString(), "UTF-8")}:${java.net.URLEncoder.encode(password.text.toString(), "UTF-8")}@"
-                    values["MONGODB_URI"] = "mongodb://$credentials${host.text.toString().trim()}:${port.text.toString().trim()}/$dbName"
+                if (kind != "sqlite") {
+                    val encodedUser = java.net.URLEncoder.encode(dbUser, "UTF-8").replace("+", "%20")
+                    val encodedPassword = java.net.URLEncoder.encode(dbPassword, "UTF-8").replace("+", "%20")
+                    val credentials = if (dbUser.isBlank()) "" else "$encodedUser:$encodedPassword@"
+                    val scheme = when (kind) { "mysql" -> "mysql"; "postgres" -> "postgresql"; else -> "mongodb" }
+                    values["DATABASE_URL"] = "$scheme://$credentials$dbHost:$dbPort/$dbName"
+                    if (kind == "mongodb") values["MONGODB_URI"] = values["DATABASE_URL"].orEmpty()
                 }
-                val keys = values.keys
-                val remaining = env.filterNot { line -> keys.any { line.trim().startsWith("$it=") } }
+                val managedKeys = setOf("DB_TYPE", "DB_NAME", "DB_HOST", "DB_PORT", "DB_USER", "DB_PASSWORD", "DB_PATH", "DATABASE_URL", "MONGODB_URI")
+                val remaining = env.filterNot { line -> managedKeys.any { line.trim().startsWith("$it=") } }
                 val escaped = values.map { (k, v) -> "$k=${v.replace("\\", "\\\\").replace("\n", "")}" }
                 runCatching { root.mkdirs(); envFile.writeText((remaining + escaped).joinToString("\n") + "\n") }
                     .onSuccess { note("Database settings saved to ${envFile.name}. Restart the backend to apply them."); databaseError = "Settings saved. Tap Refresh tables to connect."; databaseAction = "tables"; render() }
