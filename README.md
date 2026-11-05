@@ -15,6 +15,8 @@ Pocket Tunnel is a native Android app that is designed to run a Node.js backend 
 
 Tunnels are managed from the home list, so creating a second tunnel never resets the first one.
 
+From a tunnel's detail page, **Project tools** opens a browser for the extracted ZIP and a read-only **Database manager**. The file browser navigates folders and previews common text files. The database manager lists SQLite tables directly, or connects to MySQL/MariaDB, PostgreSQL, and MongoDB using the backend `.env` settings; selecting a table or collection shows at most 100 rows. For network databases, include the matching `mysql2`, `pg`, or `mongodb` driver in the ZIP's `node_modules`. Database writes are not available in the app.
+
 - Every tunnel profile (name, project, ZIP, port, entry file, hostname, tunnel ID, zone, flags) is stored as JSON in `tunnels` shared preferences and survives app restarts.
 - Each tunnel gets its own encrypted connector token (`tunnel-token:<id>` in the Keystore-backed SecretStore).
 - From the list, tapping a finished tunnel opens its detail page with all saved info, Start/Stop actions, Edit, and Delete. Delete works locally, or locally plus remotely through `DELETE /accounts/<id>/cfd_tunnel`.

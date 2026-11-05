@@ -22,6 +22,8 @@ import java.util.Date
 import java.util.Locale
 import java.util.UUID
 import java.util.zip.ZipInputStream
+import org.json.JSONArray
+import org.json.JSONObject
 
 class MainActivity : Activity() {
     private val prefs by lazy { getSharedPreferences("setup", MODE_PRIVATE) }
@@ -32,6 +34,20 @@ class MainActivity : Activity() {
     private var detailId = ""
     private var editingComplete = false
     private var draft: TunnelProfile? = null
+    private var fileRelativePath = ""
+    private var previewRelativePath = ""
+    private var databaseProvider = ""
+    private var databaseName = ""
+    private var databaseHost = ""
+    private var databaseError = ""
+    private var databaseTables = JSONArray()
+    private var databaseColumns = JSONArray()
+    private var databaseRows = JSONArray()
+    private var databaseLoading = false
+    private var databaseAction = "tables"
+    private var databaseSchema = ""
+    private var databaseTable = ""
+    private var databaseRequestId = ""
     private val green = Color.rgb(38, 102, 69)
     private val ink = Color.rgb(28, 43, 35)
     private val muted = Color.rgb(112, 127, 117)
@@ -55,6 +71,26 @@ class MainActivity : Activity() {
         }
     }
 
+    private val databaseReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.getStringExtra(DatabaseInspectorService.EXTRA_REQUEST_ID) != databaseRequestId) return
+            databaseLoading = false
+            val result = runCatching { JSONObject(intent.getStringExtra(DatabaseInspectorService.EXTRA_RESULT).orEmpty()) }.getOrNull()
+            if (result == null || !result.optBoolean("ok")) {
+                databaseError = result?.optString("error")?.takeIf { it.isNotBlank() } ?: "Database inspection failed."
+            } else {
+                databaseError = ""
+                databaseProvider = result.optString("provider", databaseProvider)
+                databaseName = result.optString("database", databaseName)
+                databaseHost = result.optString("host", databaseHost)
+                if (databaseAction == "tables") databaseTables = result.optJSONArray("tables") ?: JSONArray()
+                databaseColumns = result.optJSONArray("columns") ?: JSONArray()
+                databaseRows = result.optJSONArray("rows") ?: JSONArray()
+            }
+            render()
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         if (android.os.Build.VERSION.SDK_INT >= 26) {
@@ -65,18 +101,27 @@ class MainActivity : Activity() {
         store.migrateLegacy(prefs, secrets)
         RunStatus.seed(this)
         registerReceiver(receiver, IntentFilter(RuntimeService.BROADCAST))
+        registerReceiver(databaseReceiver, IntentFilter(DatabaseInspectorService.ACTION_RESULT))
         render()
     }
 
     override fun onDestroy() {
         runCatching { unregisterReceiver(receiver) }
+        runCatching { unregisterReceiver(databaseReceiver) }
         super.onDestroy()
     }
 
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
         if (screen != "home") {
-            screen = if (screen == "wizard" && editingComplete) "detail" else "home"
+            screen = when (screen) {
+                "wizard" -> if (editingComplete) "detail" else "home"
+                "detail" -> "home"
+                "files", "databases" -> "detail"
+                "file_preview" -> "files"
+                "database_rows" -> "databases"
+                else -> "home"
+            }
             render()
         } else {
             super.onBackPressed()
@@ -96,6 +141,10 @@ class MainActivity : Activity() {
             "profile" -> profileScreen()
             "wizard" -> wizardScreen()
             "detail" -> detailScreen()
+            "files" -> projectFilesScreen()
+            "file_preview" -> projectFilePreviewScreen()
+            "databases" -> databaseScreen()
+            "database_rows" -> databaseRowsScreen()
         }
     }
 
@@ -113,6 +162,10 @@ class MainActivity : Activity() {
                 text = when (screen) {
                     "profile" -> "‹  Tunnels"
                     "wizard" -> "‹  " + if (editingComplete) "Tunnel" else "Tunnels"
+                    "files" -> "‹  ${store.get(detailId)?.name ?: "Project"}"
+                    "file_preview" -> "‹  Project files"
+                    "databases" -> "‹  ${store.get(detailId)?.name ?: "Database"}"
+                    "database_rows" -> "‹  Tables"
                     else -> "‹  Tunnels"
                 }
                 textSize = 14f; setTextColor(green); setTypeface(null, 1); gravity = Gravity.CENTER_VERTICAL
@@ -127,6 +180,9 @@ class MainActivity : Activity() {
     private fun goBackScreen() {
         when (screen) {
             "wizard" -> screen = if (editingComplete) "detail" else "home"
+            "files", "databases" -> screen = "detail"
+            "file_preview" -> screen = "files"
+            "database_rows" -> screen = "databases"
             else -> screen = "home"
         }
         render()
@@ -425,6 +481,10 @@ class MainActivity : Activity() {
         row("Project folder", tunnel.projectName)
         row("Working directory", store.projectDirOf(tunnel).absolutePath)
         row("Backend ZIP", tunnel.zipName.ifBlank { "not selected" })
+        card("Project tools")
+        button("Browse extracted project files", false) { openProjectFiles(tunnel) }
+        button("Database manager", false) { openDatabaseManager(tunnel) }
+        caption("Browse every extracted file or inspect the database configured for this backend.")
         card("Cloudflare tunnel")
         rowCopy("Tunnel ID", tunnel.tunnelId.ifBlank { "not created yet" }, "Tunnel ID")
         row("DNS zone", tunnel.zoneName.ifBlank { "not routed yet" })
@@ -461,6 +521,295 @@ class MainActivity : Activity() {
         }
         button("Edit tunnel", false) { openWizard(tunnel) }
         button("Delete tunnel", false) { deleteDialog(tunnel) }
+    }
+
+    private fun openProjectFiles(tunnel: TunnelProfile) {
+        detailId = tunnel.id
+        fileRelativePath = ""
+        previewRelativePath = ""
+        screen = "files"
+        render()
+    }
+
+    private fun projectFilesScreen() {
+        val tunnel = store.get(detailId) ?: run { screen = "home"; render(); return }
+        val root = store.projectDirOf(tunnel).canonicalFile
+        text(body, "PROJECT FILES", 11, green, true, 0, 8)
+        text(body, tunnel.projectName, 26, ink, true, 0, 5)
+        text(body, "Everything extracted from ${tunnel.zipName.ifBlank { "the backend ZIP" }} is shown here. Open folders to browse their contents.", 13, muted, false, 0, 14)
+        if (!root.isDirectory) {
+            card("Project ZIP not extracted")
+            button("Extract project ZIP", true) {
+                if (tunnel.zipPath.isBlank() || !File(tunnel.zipPath).isFile) {
+                    note("The selected ZIP is missing. Edit the tunnel and choose it again.")
+                } else {
+                    extractAndReport(tunnel)
+                    fileRelativePath = ""
+                    render()
+                }
+            }
+            return
+        }
+
+        val current = File(root, fileRelativePath).canonicalFile
+        if (!current.path.startsWith(root.path)) {
+            fileRelativePath = ""
+            render()
+            return
+        }
+        text(body, if (fileRelativePath.isBlank()) "/${root.name}" else "/${root.name}/$fileRelativePath", 11, muted, false, 2, 10)
+        if (fileRelativePath.isNotBlank()) button("‹  Parent folder", false) {
+            fileRelativePath = File(fileRelativePath).parent?.takeIf { it != "." }.orEmpty()
+            render()
+        }
+
+        val entries = current.listFiles()?.sortedWith(compareBy<File>({ !it.isDirectory }, { it.name.lowercase(Locale.US) })).orEmpty()
+        if (entries.isEmpty()) {
+            card("This folder is empty")
+            return
+        }
+        entries.forEach { entry ->
+            val relative = entry.relativeTo(root).path
+            val item = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(14), dp(11), dp(14), dp(11))
+                setBackgroundColor(Color.WHITE)
+                isClickable = true
+                isFocusable = true
+                setOnClickListener {
+                    if (entry.isDirectory) {
+                        fileRelativePath = relative
+                        render()
+                    } else {
+                        previewRelativePath = relative
+                        screen = "file_preview"
+                        render()
+                    }
+                }
+            }
+            item.addView(TextView(this).apply {
+                text = (if (entry.isDirectory) "📁  " else "📄  ") + entry.name
+                textSize = 13f
+                setTextColor(ink)
+            })
+            item.addView(TextView(this).apply {
+                text = if (entry.isDirectory) "Folder" else formatFileSize(entry.length())
+                textSize = 11f
+                setTextColor(muted)
+                setPadding(0, dp(3), 0, 0)
+            })
+            body.addView(item, match(5))
+        }
+    }
+
+    private fun projectFilePreviewScreen() {
+        val tunnel = store.get(detailId) ?: run { screen = "home"; render(); return }
+        val root = store.projectDirOf(tunnel).canonicalFile
+        val file = File(root, previewRelativePath).canonicalFile
+        text(body, "PROJECT FILE", 11, green, true, 0, 8)
+        text(body, file.name, 24, ink, true, 0, 6)
+        text(body, "/${tunnel.projectName}/$previewRelativePath  ·  ${formatFileSize(file.length())}", 11, muted, false, 0, 12)
+        if (!file.path.startsWith(root.path + File.separator) || !file.isFile) {
+            card("File unavailable")
+            caption("This file is no longer inside the extracted project folder.")
+            return
+        }
+        val extension = file.extension.lowercase(Locale.US)
+        val textExtensions = setOf("txt", "md", "json", "js", "cjs", "mjs", "ts", "tsx", "jsx", "html", "css", "xml", "yml", "yaml", "env", "sql", "py", "java", "kt", "properties", "sh", "log", "conf", "ini", "toml", "csv")
+        if (extension !in textExtensions) {
+            card("No text preview")
+            caption("This file type can be browsed, but Pocket Tunnel does not render it as text.")
+            return
+        }
+        if (file.length() > 512 * 1024) {
+            card("File is too large to preview")
+            caption("The file is ${formatFileSize(file.length())}. The browser still shows it in the project folder.")
+            return
+        }
+        val bytes = ByteArray(128 * 1024)
+        val count = runCatching { file.inputStream().use { it.read(bytes) } }.getOrElse {
+            card("Could not read file")
+            caption(it.message ?: "File read failed.")
+            return
+        }
+        if (count <= 0) {
+            card("Empty file")
+            return
+        }
+        if (bytes.take(count).any { it == 0.toByte() }) {
+            card("Binary file")
+            caption("This file contains binary data and is not shown as text.")
+            return
+        }
+        val content = String(bytes, 0, count, Charsets.UTF_8)
+        val preview = TextView(this).apply {
+            text = content
+            textSize = 11f
+            typeface = android.graphics.Typeface.MONOSPACE
+            setTextColor(ink)
+            setPadding(dp(13), dp(13), dp(13), dp(13))
+            setBackgroundColor(Color.WHITE)
+        }
+        body.addView(preview, match(8))
+        if (file.length() > count) caption("Preview is limited to the first 128 KB.")
+    }
+
+    private fun formatFileSize(bytes: Long): String = when {
+        bytes < 1024 -> "$bytes B"
+        bytes < 1024 * 1024 -> "${bytes / 1024} KB"
+        else -> String.format(Locale.US, "%.1f MB", bytes / (1024.0 * 1024.0))
+    }
+
+    private fun openDatabaseManager(tunnel: TunnelProfile) {
+        detailId = tunnel.id
+        databaseProvider = ""
+        databaseName = ""
+        databaseHost = ""
+        databaseError = ""
+        databaseTables = JSONArray()
+        databaseColumns = JSONArray()
+        databaseRows = JSONArray()
+        databaseSchema = ""
+        databaseTable = ""
+        screen = "databases"
+        requestDatabaseInspection("tables")
+    }
+
+    private fun requestDatabaseInspection(action: String, schema: String = "", table: String = "") {
+        val tunnel = store.get(detailId) ?: return
+        val projectRoot = databaseWorkingDirectory(tunnel)
+        if (!projectRoot.isDirectory) {
+            databaseError = "Extract the backend ZIP first, then open Database manager again."
+            databaseLoading = false
+            render()
+            return
+        }
+        if (!File(projectRoot, ".env").isFile) {
+            databaseError = "No project .env file was found. Add DATABASE_URL or DB_HOST/DB_USER/DB_PASSWORD settings, then extract the ZIP again."
+            databaseLoading = false
+            render()
+            return
+        }
+        databaseAction = action
+        databaseSchema = schema
+        databaseTable = table
+        databaseLoading = true
+        databaseError = ""
+        databaseRequestId = UUID.randomUUID().toString()
+        render()
+        startService(Intent(this, DatabaseInspectorService::class.java).apply {
+            this.action = DatabaseInspectorService.ACTION_INSPECT
+            putExtra(DatabaseInspectorService.EXTRA_REQUEST_ID, databaseRequestId)
+            putExtra(DatabaseInspectorService.EXTRA_PROJECT_ROOT, projectRoot.absolutePath)
+            putExtra(DatabaseInspectorService.EXTRA_ACTION, action)
+            putExtra(DatabaseInspectorService.EXTRA_SCHEMA, schema)
+            putExtra(DatabaseInspectorService.EXTRA_TABLE, table)
+        })
+    }
+
+    private fun databaseWorkingDirectory(tunnel: TunnelProfile): File {
+        val root = store.projectDirOf(tunnel).canonicalFile
+        val entry = File(root, tunnel.entry).canonicalFile
+        if (!entry.path.startsWith(root.path + File.separator) || !entry.isFile) return root
+        return generateSequence(entry.parentFile) { it.parentFile }
+            .takeWhile { it.path == root.path || it.path.startsWith(root.path + File.separator) }
+            .firstOrNull { File(it, "package.json").isFile } ?: root
+    }
+
+    private fun databaseScreen() {
+        val tunnel = store.get(detailId) ?: run { screen = "home"; render(); return }
+        text(body, "DATABASE MANAGER", 11, green, true, 0, 8)
+        text(body, "${tunnel.projectName} database", 26, ink, true, 0, 6)
+        text(body, "Read-only access to the database configured for this extracted backend. Password values stay hidden and are read from its .env file.", 13, muted, false, 0, 12)
+        card("Connection")
+        if (databaseProvider.isNotBlank()) row("Database type", databaseProvider)
+        if (databaseName.isNotBlank()) row("Database", databaseName)
+        if (databaseHost.isNotBlank()) row("Host", databaseHost)
+        button(if (databaseLoading) "Connecting…" else "Refresh tables", true) {
+            if (!databaseLoading) requestDatabaseInspection("tables")
+        }
+        if (databaseError.isNotBlank()) {
+            card("Could not open database")
+            text(body, databaseError, 12, alert, false, 0, 8)
+        }
+        if (databaseLoading) {
+            caption(if (databaseAction == "rows") "Loading the first 100 rows…" else "Connecting and listing tables…")
+        } else if (databaseAction == "tables" && databaseError.isBlank()) {
+            card("Tables and collections")
+            if (databaseTables.length() == 0) {
+                text(body, "No tables were returned. Check the database name and the account's read permissions.", 12, muted, false, 0, 8)
+            } else {
+                for (i in 0 until databaseTables.length()) {
+                    val item = databaseTables.optJSONObject(i) ?: continue
+                    val tableName = item.optString("name")
+                    val schema = item.optString("schema")
+                    val kind = item.optString("kind", "table")
+                    val button = TextView(this).apply {
+                        text = "$tableName  ·  $kind"
+                        textSize = 13f
+                        setTextColor(green)
+                        setPadding(dp(14), dp(13), dp(14), dp(13))
+                        setBackgroundColor(Color.WHITE)
+                        isClickable = true
+                        isFocusable = true
+                        setOnClickListener {
+                            databaseSchema = schema
+                            databaseTable = tableName
+                            screen = "database_rows"
+                            requestDatabaseInspection("rows", schema, tableName)
+                        }
+                    }
+                    body.addView(button, match(5))
+                }
+            }
+        }
+        caption("MySQL/MariaDB, PostgreSQL and MongoDB use the matching driver in the ZIP's node_modules. SQLite files are opened directly by Android. Queries are read-only and limited to 100 rows per table.")
+    }
+
+    private fun databaseRowsScreen() {
+        text(body, "DATABASE TABLE", 11, green, true, 0, 8)
+        text(body, databaseTable, 26, ink, true, 0, 6)
+        val scope = listOf(databaseSchema, databaseName).filter { it.isNotBlank() }.joinToString(" · ")
+        if (scope.isNotBlank()) text(body, scope, 12, muted, false, 0, 10)
+        if (databaseLoading) {
+            card("Loading rows…")
+            return
+        }
+        if (databaseError.isNotBlank()) {
+            card("Could not read this table")
+            text(body, databaseError, 12, alert, false, 0, 8)
+            button("Retry", true) { requestDatabaseInspection("rows", databaseSchema, databaseTable) }
+            return
+        }
+        val columnNames = (0 until databaseColumns.length()).map { databaseColumns.optString(it) }
+        val display = StringBuilder()
+        for (rowIndex in 0 until databaseRows.length()) {
+            val values = databaseRows.optJSONArray(rowIndex) ?: continue
+            display.append("ROW ").append(rowIndex + 1).append('\n')
+            for (columnIndex in columnNames.indices) {
+                val value = values.opt(columnIndex)
+                display.append(columnNames[columnIndex]).append(": ")
+                    .append(if (value == null || value == JSONObject.NULL) "NULL" else value.toString())
+                    .append('\n')
+            }
+            display.append('\n')
+            if (display.length > 96_000) break
+        }
+        if (databaseRows.length() == 0) {
+            card("No rows")
+            caption("This table exists but is currently empty.")
+            return
+        }
+        val values = TextView(this).apply {
+            text = display.toString().take(96_000)
+            textSize = 11f
+            typeface = android.graphics.Typeface.MONOSPACE
+            setTextColor(ink)
+            setPadding(dp(13), dp(13), dp(13), dp(13))
+            setBackgroundColor(Color.WHITE)
+        }
+        body.addView(values, match(8))
+        caption("Showing up to 100 rows. Values are clipped to 500 characters each.")
     }
 
     private fun openWizard(existing: TunnelProfile?, startPage: Int = 0) {
